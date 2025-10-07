@@ -67,6 +67,11 @@
 #include "internal.h"
 #include "swap.h"
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#include <asm/msr.h>
+#endif
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
 
@@ -7498,6 +7503,844 @@ clear_reclaim_active(pg_data_t *pgdat, int highest_zoneidx)
 	update_reclaim_active(pgdat, highest_zoneidx, false);
 }
 
+// ------------------------- perapp reclaim logic -------------------------
+#ifdef CONFIG_PAPP
+
+/*
+ * moves folios back to app's page list
+ * lock must be held by the caller
+ * on return, list is reused as a list of folios to be freed (to ensure race condition)
+ * returns the number of pages moved back to page list
+ */
+static unsigned int per_app_move_folios_to_page_list(struct per_app *app,
+						     struct list_head *list)
+{
+	int nr_pages, nr_moved = 0;
+	LIST_HEAD(folios_to_free);
+
+	while (!list_empty(list)) {
+		struct folio *folio = lru_to_folio(list);
+		VM_BUG_ON_FOLIO(folio_test_per_app(folio), folio);
+		list_del(&folio->lru);
+		if (unlikely(!folio_evictable(folio))) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[per_app_move_folios_to_page_list]: THIS PAGE IS UNEVICTABLE\n");
+#endif
+			BUG();
+		}
+		folio_set_per_app(folio);
+		if (unlikely(folio_put_testzero(folio))) {
+			folio_clear_per_app(folio);
+			if (unlikely(folio_test_large(folio))) {
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[per_app_move_folios_to_page_list]: THIS PAGE IS LARGE\n");
+#endif
+				BUG();
+			} else
+				list_add(&folio->lru, &folios_to_free);
+			continue;
+		}
+		list_add(&folio->lru, &app->page_list);
+		nr_pages = folio_nr_pages(folio);
+		nr_moved += nr_pages;
+		// working set estimation for active pages
+	}
+	list_splice(&folios_to_free, list);
+	return nr_moved;
+}
+
+/*
+ * reclaim pages inside of isolated per_app folio list
+ * returns the number of pages reclaimed
+ */
+static unsigned int per_app_shrink_app(struct list_head *folio_list,
+				       struct pglist_data *pgdat,
+				       struct scan_control *sc,
+				       struct reclaim_stat *stat)
+{
+	LIST_HEAD(ret_folios);
+	LIST_HEAD(free_folios);
+	unsigned int nr_reclaimed = 0;
+	struct swap_iocb *plug = NULL;
+
+	memset(stat, 0, sizeof(*stat));
+
+	/*
+	* our scheme does not activate/deactivate pages
+	unsigned int pgactivate = 0;
+	*/
+
+	/*
+	* demoting pages to a different tier (e.g. NUMA) may not be necessary,
+	* since most mobile devices work with a single node.
+	LIST_HEAD(demote_folios);
+	bool do_demote_pass;
+	do_demote_pass = can_demote(pgdat->node_id, sc);
+	*/
+
+	cond_resched();
+
+	while (!list_empty(folio_list)) {
+		struct address_space *mapping;
+		struct folio *folio;
+		bool dirty, writeback;
+		unsigned int nr_pages;
+
+		//bool file;
+
+		cond_resched();
+
+		folio = lru_to_folio(folio_list);
+		list_del(&folio->lru);
+
+		//file = !folio_test_anon(folio);
+
+		if (!folio_trylock(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[perapp reclaim]: keep: folio_trylock failed, folio is contended.\n");
+#endif
+			goto keep;
+		}
+		nr_pages = folio_nr_pages(folio);
+		sc->nr_scanned += nr_pages;
+
+		if (unlikely(!folio_evictable(folio))) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[perapp reclaim]: keep_locked: folio is not evictable.\n");
+#endif
+			goto keep_locked;
+		}
+
+		if (!sc->may_unmap && folio_mapped(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[perapp reclaim]: keep_locked: cannot unmap mapped folio.\n");
+			pr_info("                  sc->may_unmap=%d, folio_mapped=%d\n",
+				sc->may_unmap, folio_mapped(folio));
+#endif
+			goto keep_locked;
+		}
+
+		/*
+		* we ignore lru gen, as per-app pages are reclaimed separately
+		if (lru_gen_enabled() && !ignore_references &&
+			folio_mapped(folio) && folio_test_referenced(folio))
+		goto keep_locked;
+		*/
+
+		// this page is being shared! must go back to LRU
+		if (folio_mapcount(folio) > 1) {
+			WARN(1,
+			     "[per_app_shrink_app] this page has mapcount > 1\n");
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[perapp reclaim]: THIS PAGE IS SHARED\n");
+			pr_info("[perapp reclaim]: keep_locked: folio is shared and cannot be reclaimed.\n");
+			pr_info("                  folio_mapcount=%d\n",
+				folio_mapcount(folio));
+#endif
+			goto keep_locked;
+		}
+
+		// handling dirty or writeback
+		folio_check_dirty_writeback(folio, &dirty, &writeback);
+		if (dirty || writeback) {
+			stat->nr_dirty += nr_pages;
+		}
+		if (dirty && !writeback) {
+			stat->nr_unqueued_dirty += nr_pages;
+		}
+		if (writeback && folio_test_reclaim(folio)) {
+			stat->nr_congested += nr_pages;
+			pr_info(" this page is congested!!\n");
+		}
+		if (folio_test_writeback(folio)) {
+			if (current_is_kswapd() && folio_test_reclaim(folio) &&
+			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
+				stat->nr_immediate += nr_pages;
+				goto keep_locked; // there is no activate_locked
+			} else if (writeback_throttling_sane(sc) ||
+				   !folio_test_reclaim(folio) ||
+				   !may_enter_fs(folio, sc->gfp_mask)) {
+				folio_set_reclaim(folio);
+				stat->nr_writeback += nr_pages;
+				goto keep_locked; // there is no activate_locked
+			} else {
+				folio_unlock(folio);
+				folio_wait_writeback(folio);
+				list_add_tail(&folio->lru, folio_list);
+				continue;
+			}
+		}
+
+		/*
+		* we may omit page demotion since most mobile devices have a single node anyway
+		if (do_demote_pass &&
+			(thp_migration_supported() || !folio_test_large(folio))) {
+		list_add(&folio->lru, &demote_folios);
+		folio_unlock(folio);
+		continue;
+		}
+		*/
+
+		// add_to_swap
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("[perapp reclaim]: add_to_swap begins\n");
+#endif
+		if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
+			if (!folio_test_swapcache(folio)) {
+				if (!(sc->gfp_mask & __GFP_IO)) {
+#ifdef CONFIG_DEBUG_PAPP
+					pr_info("[perapp reclaim]: keep_locked: cannot add to swap, gfp_mask lacks __GFP_IO.\n");
+					pr_info("                  sc->gfp_mask=0x%x\n",
+						sc->gfp_mask);
+#endif
+					goto keep_locked;
+				}
+				if (folio_maybe_dma_pinned(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+					pr_info("[perapp reclaim]: keep_locked: cannot add to swap, folio is DMA pinned.\n");
+#endif
+					goto keep_locked;
+				}
+				if (folio_test_large(folio)) {
+					if (!can_split_folio(folio, NULL)) {
+#ifdef CONFIG_DEBUG_PAPP
+						pr_info("[perapp reclaim]: keep_locked: large folio cannot be split for swap.\n");
+#endif
+						goto keep_locked; // there is no activate_locked
+					}
+					if (!folio_entire_mapcount(folio) &&
+					    split_folio_to_list(folio,
+								folio_list)) {
+#ifdef CONFIG_DEBUG_PAPP
+						pr_info("[perapp reclaim]: keep_locked: split_folio_to_list failed for large folio.\n");
+#endif
+						goto keep_locked; // there is no activate_locked
+					}
+				}
+				if (!add_to_swap(folio)) {
+					if (!folio_test_large(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+						pr_info("[perapp reclaim]: keep_locked: add_to_swap failed for non-large folio.\n");
+#endif
+						goto keep_locked; // there is no activate_locked_split
+					}
+					if (split_folio_to_list(folio,
+								folio_list)) {
+#ifdef CONFIG_DEBUG_PAPP
+						pr_info("[perapp reclaim]: keep_locked: split failed after initial add_to_swap failure.\n");
+#endif
+						goto keep_locked; // there is no activate_locked
+					}
+					if (!add_to_swap(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+						pr_info("[perapp reclaim]: keep_locked: add_to_swap failed again after split.\n");
+#endif
+						goto keep_locked; // there is no activate_locked_split
+					}
+				}
+			}
+		} else if (folio_test_swapbacked(folio) &&
+			   folio_test_large(folio)) {
+			if (split_folio_to_list(folio, folio_list)) {
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[perapp reclaim]: keep_locked: failed to split large swapbacked folio.\n");
+#endif
+				goto keep_locked;
+			}
+		}
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("[perapp reclaim]: add_to_swap end\n");
+#endif
+
+		// if folio was split, update accounting
+		if ((nr_pages > 1) && !folio_test_large(folio)) {
+			sc->nr_scanned -= (nr_pages - 1);
+			nr_pages = 1;
+		}
+
+		// try_to_unmap
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("[perapp reclaim]: try_to_unmap begin\n");
+		pr_info("[perapp reclaim]: mapcount is %d before try_to_unmap\n",
+			folio_mapcount(folio));
+#endif
+
+		folio_set_per_app(folio); // for rmap_walk_anon
+
+		if (folio_mapped(folio)) {
+			enum ttu_flags flags = TTU_BATCH_FLUSH;
+			bool was_swapbacked = folio_test_swapbacked(folio);
+			if (folio_test_pmd_mappable(folio))
+				flags |= TTU_SPLIT_HUGE_PMD;
+			try_to_unmap(folio, flags);
+			if (folio_mapped(folio)) { // unmap somehow failed
+				stat->nr_unmap_fail += nr_pages;
+				if (!was_swapbacked &&
+				    folio_test_swapbacked(folio))
+					stat->nr_lazyfree_fail += nr_pages;
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[perapp reclaim]: keep_locked: try_to_unmap failed, folio is still mapped.\n");
+				pr_info("                  folio_mapcount=%d, was_swapbacked=%d, now_swapbacked=%d\n",
+					folio_mapcount(folio), was_swapbacked,
+					folio_test_swapbacked(folio));
+#endif
+				goto keep_locked; // there is no activate_locked
+			}
+		}
+
+		folio_clear_per_app(folio); // rmap_walk_anon should be done
+
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("[perapp reclaim]: try_to_unmap end\n");
+		pr_info("[perapp reclaim]: mapcount is %d after try_to_unmap\n",
+			folio_mapcount(folio));
+#endif
+
+		if (folio_maybe_dma_pinned(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[perapp reclaim]: keep_locked: folio is DMA pinned after unmap attempt.\n");
+#endif
+			goto keep_locked; // there is no activate_locked
+		}
+
+		// pageout
+		mapping = folio_mapping(folio);
+		if (folio_test_dirty(folio)) {
+			// only kswapd can writeback file pages
+			if (folio_is_file_lru(
+				    folio) && // it is okay to use this function, it checks PG_swapbacked
+			    (!current_is_kswapd() ||
+			     !folio_test_reclaim(folio) ||
+			     !test_bit(PGDAT_DIRTY, &pgdat->flags))) {
+				node_stat_mod_folio(folio, NR_VMSCAN_IMMEDIATE,
+						    nr_pages);
+				folio_set_reclaim(folio);
+				goto keep_locked; // there is no activate_locked
+			}
+			if (!may_enter_fs(folio, sc->gfp_mask)) {
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[perapp reclaim]: keep_locked: cannot enter FS context for writeback.\n");
+#endif
+				goto keep_locked;
+			}
+			if (!sc->may_writepage) {
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[perapp reclaim]: keep_locked: scan control forbids writepage.\n");
+				pr_info("                  sc->may_writepage=%d\n",
+					sc->may_writepage);
+#endif
+				goto keep_locked;
+			}
+
+			try_to_unmap_flush_dirty();
+			/*
+      pageout_t pageout_res = pageout(folio, mapping, &plug);
+      pr_info("[perapp reclaim]: pageout result is %s\n",
+        pageout_result_to_str(pageout_res));
+      switch (pageout_res) {
+      */
+			switch (pageout(folio, mapping, &plug)) {
+			case PAGE_KEEP:
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[perapp reclaim]: keep_locked: pageout() returned PAGE_KEEP.\n");
+#endif /* CONFIG_DEBUG_PAPP */
+				goto keep_locked;
+			case PAGE_ACTIVATE:
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[perapp reclaim]: keep_locked: pageout() returned PAGE_ACTIVATE.\n");
+#endif /* CONFIG_DEBUG_PAPP */
+				goto keep_locked; // there is no activate_locked
+			case PAGE_SUCCESS:
+				if (folio_test_writeback(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+					pr_info("[perapp reclaim]: keep: folio is under writeback after pageout(PAGE_SUCCESS).\n");
+#endif /* CONFIG_DEBUG_PAPP */
+					goto keep;
+				}
+				if (folio_test_dirty(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+					pr_info("[perapp reclaim]: keep: folio is still dirty after pageout(PAGE_SUCCESS).\n");
+#endif /* CONFIG_DEBUG_PAPP */
+					goto keep;
+				}
+				/*
+        * A synchronous write - probably a ramdisk.  Go
+        * ahead and try to reclaim the folio.
+        */
+				if (!folio_trylock(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+					pr_info("[perapp reclaim]: keep: failed to re-lock folio after sync write.\n");
+#endif /* CONFIG_DEBUG_PAPP */
+					goto keep;
+				}
+				if (folio_test_dirty(folio) ||
+				    folio_test_writeback(folio)) {
+#ifdef CONFIG_DEBUG_PAPP
+					pr_info("[perapp reclaim]: keep_locked: folio still dirty/writeback after sync write re-lock.\n");
+					pr_info("                  folio_dirty=%d, folio_writeback=%d\n",
+						folio_test_dirty(folio),
+						folio_test_writeback(folio));
+#endif /* CONFIG_DEBUG_PAPP */
+					goto keep_locked;
+				}
+				mapping = folio_mapping(folio);
+				fallthrough;
+			case PAGE_CLEAN:; /* try to free the folio below */
+			}
+		}
+
+		// free buffer mappings without I/O, if succeed free the page (file page most likely?)
+		if (folio_has_private(folio)) {
+			if (!filemap_release_folio(folio, sc->gfp_mask))
+				goto keep_locked; // there is no activate_locked
+			if (!mapping && folio_ref_count(folio) == 1) {
+				folio_unlock(folio);
+				if (folio_put_testzero(folio))
+					goto free_it;
+				else {
+					/*
+           * rare race with speculative reference.
+           * the speculative reference will free
+           * this folio shortly, so we may
+           * increment nr_reclaimed here (and
+           * leave it off the LRU).
+           */
+					nr_reclaimed += nr_pages;
+					continue;
+				}
+			}
+		}
+		// final stage for reclaiming anon page (remove_mapping)
+		if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
+			if (!folio_ref_freeze(folio, 1)) {
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[perapp reclaim]: keep_locked: folio_ref_freeze failed for anon, non-swapbacked folio.\n");
+#endif /* CONFIG_DEBUG_PAPP */
+				goto keep_locked;
+			}
+			count_vm_events(PGLAZYFREED, nr_pages);
+			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
+		} else if (!mapping ||
+			   !__remove_mapping(mapping, folio, true,
+					     sc->target_mem_cgroup)) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[perapp reclaim]: keep_locked: __remove_mapping failed.\n");
+			pr_info("                  mapping=%p\n", mapping);
+#endif
+			goto keep_locked;
+		}
+
+		folio_clear_per_app(
+			folio); // pages moved back to per-app page list will have this flag set later
+		folio_unlock(folio);
+free_it:
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("[perapp reclaim]: free_it: Reclaiming folio.\n");
+#endif
+		nr_reclaimed += nr_pages;
+		//if (file) /* did we reclaim anon or file page? */
+		//  *nr_file_reclaimed += nr_pages;
+		if (unlikely(folio_test_large(folio)))
+			destroy_large_folio(folio);
+		else
+			list_add(&folio->lru, &free_folios);
+		continue;
+
+keep_locked:
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("[perapp reclaim]: Path: keep_locked\n");
+#endif
+		folio_clear_per_app(folio); // clear per_app flag
+		folio_unlock(folio);
+keep:
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("[perapp reclaim]: Path: keep\n");
+#endif
+		list_add(&folio->lru, &ret_folios);
+		VM_BUG_ON_FOLIO(folio_test_per_app(folio) ||
+					folio_test_unevictable(folio),
+				folio);
+	}
+	/* 'folio_list' is always empty here */
+
+	/*
+	* again, page demotion may not be necessary at all
+	nr_reclaimed += demote_folio_list(&demote_folios, pgdat);
+	if (!list_empty(&demote_folios)) {
+		list_splice_init(&demote_folios, folio_list);
+		do_demote_pass = false;
+		goto retry;
+	}
+	*/
+
+	/*
+	* pgactivate is out of scope for our reclaim scheme
+	pgactivate = stat->nr_activate[0] + stat->nr_activate[1];
+	*/
+
+	mem_cgroup_uncharge_list(&free_folios);
+	try_to_unmap_flush();
+	free_unref_page_list(
+		&free_folios); // actually free pages that are reclaimed
+
+	list_splice(&ret_folios, folio_list);
+	//count_vm_events(PGACTIVATE, pgactivate);
+
+	if (plug)
+		swap_write_unplug(plug);
+
+	return nr_reclaimed;
+}
+
+/*
+ * scan pages from target app and isolate them in @dst list
+ * app->page_list_lock must be held before calling this function
+ * returns how many pages were taken from page list into @dst (can be less than nr_scanned)
+ */
+static unsigned long per_app_isolate_app(struct per_app *app,
+					 unsigned long nr_to_scan,
+					 struct list_head *dst,
+					 unsigned long *nr_scanned,
+					 struct scan_control *sc)
+{
+	struct list_head *src = &app->page_list;
+	unsigned long nr_taken = 0;
+	unsigned long nr_zone_taken[MAX_NR_ZONES] = {
+		0,
+	};
+	unsigned long nr_skipped[MAX_NR_ZONES] = {
+		0,
+	};
+	unsigned long skipped = 0;
+	unsigned long scan, total_scan,
+		nr_pages; // total_scan includes "skipped" pages
+	LIST_HEAD(folios_skipped);
+
+	total_scan = 0;
+	scan = 0;
+	while (scan < nr_to_scan && !list_empty(src)) {
+		struct list_head *move_to = src;
+		struct folio *folio;
+
+		folio = lru_to_folio(src);
+		prefetchw_prev_lru_folio(folio, src, flags);
+
+		nr_pages = folio_nr_pages(folio);
+		total_scan += nr_pages;
+
+		// debug case 1: check mapcount
+		if (folio_mapcount(folio) > 1) {
+			WARN(1,
+			     "[per_app_isolate_app] this page has mapcount > 1\n");
+			goto move;
+		}
+
+		// for some reason, all of per-app pages were being skipped..
+		if (folio_zonenum(folio) > sc->reclaim_idx) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[perapp reclaim]: PAGE IS SKIPPED\n");
+#endif
+			nr_skipped[folio_zonenum(folio)] += nr_pages;
+			move_to = &folios_skipped;
+			goto move;
+		}
+
+		scan += nr_pages;
+
+		if (!folio_test_per_app(folio))
+			goto move;
+		if (!sc->may_unmap && folio_mapped(folio))
+			goto move;
+
+		if (unlikely(!folio_try_get(folio))) {
+			pr_emerg(
+				" [per_app_isolate_app] refcount was not successfully incremented\n");
+			goto move;
+		}
+
+		// we still need the per_app flag for operations like try_to_unmap, folio_check_references
+		// TODO: consider clearing the per_app flag here..? (per_app_try_to_unmap)
+		// since the current way can never detect isolate race condition (it never clears here)
+		if (!folio_test_clear_per_app(folio)) {
+			folio_put(folio);
+			goto move;
+		}
+
+		nr_taken += nr_pages;
+		nr_zone_taken[folio_zonenum(folio)] += nr_pages;
+		move_to = dst;
+move:
+		list_move(&folio->lru, move_to);
+	}
+	if (!list_empty(&folios_skipped)) {
+		int zid;
+		list_splice(
+			&folios_skipped,
+			src); // put skipped CMA pages back to head (should move to tail instead?)
+		for (zid = 0; zid < MAX_NR_ZONES; zid++) {
+			if (!nr_skipped[zid])
+				continue;
+			__count_zid_vm_events(PGSCAN_SKIP, zid,
+					      nr_skipped[zid]);
+			skipped += nr_skipped[zid];
+		}
+	}
+	*nr_scanned = total_scan;
+	// tracing was here
+	// skip updating lru size
+#ifdef CONFIG_DEBUG_PAPP
+	pr_info("  scan amount is %lu, total scan is %lu\n", scan, total_scan);
+#endif
+	return nr_taken;
+}
+
+/*
+ * per-app version of shrink_node (node is kinda irrelevant I guess..)
+ * sets up scan_control and start reclaiming app's pages
+ * returns true if kswapd scanned at least the request number of pages to reclaim
+ * if not, continue with the default reclaim
+ */
+static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+{
+	unsigned long nr_reclaimed, nr_scanned, nr_taken;
+	struct zone *zone;
+	int z;
+	struct per_app *target_app;
+	//bool skip;
+	enum vm_event_item item;
+	struct blk_plug plug;
+
+	// set up scan control (nr_to_reclaim, nr_reclaimed, nr_scanned, etc)
+
+	// per_app_shrink_node may called from different context (e.g. force reclaim)
+	// and sc->nr_to_reclaim may not be zero. In that case, respect the sc->nr_to_reclaim.
+	if (sc->nr_to_reclaim == 0) {
+		for (z = 0; z <= sc->reclaim_idx; z++) {
+			zone = pgdat->node_zones + z;
+			if (!managed_zone(zone))
+				continue;
+			//sc->nr_to_reclaim += max(high_wmark_pages(zone), APP_CLUSTER_MAX);
+			sc->nr_to_reclaim +=
+				max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
+		}
+	}
+
+	sc->nr_reclaimed = 0;
+	sc->nr_scanned = 0;
+
+	blk_start_plug(&plug);
+
+	while (sc->nr_reclaimed < sc->nr_to_reclaim) {
+		LIST_HEAD(folio_list);
+		unsigned long nr_to_scan;
+		long nr_pages;
+		struct reclaim_stat stat;
+		// TODO: per-app pages should consider BOTH anon and file
+		bool file = false;
+		unsigned long remaining_to_reclaim;
+		//unsigned long nr_file_reclaimed = 0;
+		// struct blk_plug plug;
+
+		cond_resched();
+		/*
+		blk_start_plug(&plug);
+		plug_started = true;
+		*/
+		target_app = per_app_select_app();
+		if (!target_app) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("  [per_app_shrink_node] there is no app to reclaim: break\n");
+#endif
+			break;
+		}
+#ifdef CONFIG_DEBUG_PAPP
+		per_app_print_reclaim_status(target_app);
+#endif
+
+		nr_pages = per_app_get_page_count(target_app);
+
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("  [per_app_shrink_node] target app uid <%u> with %ld pages\n",
+			from_kuid(&init_user_ns, target_app->uid), nr_pages);
+#endif
+
+		if (!nr_pages) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("  [per_app_shrink_node]: this app has 0 page: continue\n");
+#endif
+			/* this app has no pages to reclaim */
+			per_app_advance_reclaim_state(target_app);
+#ifdef CONFIG_PAPP_USE_KREF
+			per_app_put(target_app);
+#endif
+			/*
+			if (plug_started) {
+				blk_finish_plug(&plug);
+				plug_started = false;
+			}
+			*/
+			continue;
+		}
+
+		/*
+		* custom skip policy
+		trace_android_vh_shrink_node_per_app(app, &skip);
+		if (skip)
+		continue;
+		*/
+
+		nr_to_scan = per_app_calculate_nr_to_scan(target_app);
+		if (!nr_to_scan) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("  [per_app_shrink_node]: 0 page to scan from this app: continue\n");
+#endif
+			/* not enough pages to reclaim */
+			per_app_advance_reclaim_state(target_app);
+#ifdef CONFIG_PAPP_USE_KREF
+			per_app_put(target_app);
+#endif
+			/*
+			if (plug_started) {
+				blk_finish_plug(&plug);
+				plug_started = false;
+			}
+			*/
+			continue;
+		}
+
+		/* Limit nr_to_scan to respect the total reclaim target */
+		remaining_to_reclaim =
+			max(sc->nr_to_reclaim - sc->nr_reclaimed, 0UL);
+		if (remaining_to_reclaim > 0UL) {
+			nr_to_scan = min(nr_to_scan, remaining_to_reclaim);
+		}
+
+		spin_lock(&target_app->page_list_lock);
+		nr_taken = per_app_isolate_app(target_app, nr_to_scan,
+					       &folio_list, &nr_scanned, sc);
+
+		// TODO: we may need a new node_stat_item like NR_ISOLATED_PER_APP
+		__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+		item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
+		if (!cgroup_reclaim(sc))
+			__count_vm_events(item, nr_scanned);
+		//__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
+		__count_vm_events(PGSCAN_ANON + file, nr_scanned);
+
+		spin_unlock(&target_app->page_list_lock);
+		if (!nr_taken) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("  [per_app_shrink_node]: 0 page taken from this app: continue\n");
+#endif
+			/* failed to isolate any page from this app */
+			per_app_advance_reclaim_state(target_app);
+#ifdef CONFIG_PAPP_USE_KREF
+			per_app_put(target_app);
+#endif
+			/*
+			if (plug_started) {
+				blk_finish_plug(&plug);
+				plug_started = false;
+			}
+			*/
+			continue;
+		}
+
+		//nr_reclaimed = per_app_shrink_app(&folio_list, pgdat, sc, &stat, &nr_file_reclaimed);
+		nr_reclaimed =
+			per_app_shrink_app(&folio_list, pgdat, sc, &stat);
+
+		spin_lock(&target_app->page_list_lock);
+		per_app_move_folios_to_page_list(target_app, &folio_list);
+
+		item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+		if (!cgroup_reclaim(sc))
+			__count_vm_events(item, nr_reclaimed);
+		//__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+		__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+		spin_unlock(&target_app->page_list_lock);
+
+		// UPDATING SCAN_CONTROL VALUES
+		sc->nr_reclaimed +=
+			nr_reclaimed; // this is originally done inside shrink_lruvec()
+		/* updating target app reclaim state and account for reclaimed pages */
+		per_app_try_to_advance_reclaim_state(target_app, nr_reclaimed);
+
+		//atomic_long_add(nr_file_reclaimed, &target_app->nr_file_reclaimed);
+		//atomic_long_add(nr_reclaimed - nr_file_reclaimed, &target_app->nr_anon_reclaimed);
+
+		//lru_note_cost(lruvec, file, stat.nr_pageout);
+		mem_cgroup_uncharge_list(&folio_list);
+		free_unref_page_list(&folio_list);
+
+		if (stat.nr_unqueued_dirty == nr_taken) {
+			wakeup_flusher_threads(WB_REASON_VMSCAN);
+			if (!writeback_throttling_sane(sc))
+				reclaim_throttle(pgdat,
+						 VMSCAN_THROTTLE_WRITEBACK);
+		}
+		sc->nr.dirty += stat.nr_dirty;
+		sc->nr.congested += stat.nr_congested;
+		sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
+		sc->nr.writeback += stat.nr_writeback;
+		sc->nr.immediate += stat.nr_immediate;
+		sc->nr.taken += nr_taken;
+		if (file) // TODO: again, we reclaimed a mix of anon and file per-app pages..
+			sc->nr.file_taken += nr_taken;
+
+#ifdef CONFIG_PAPP_USE_KREF
+		// if app was selected, we must have a matching put for per_app_select_app()
+		per_app_put(target_app);
+#endif
+		/*
+		// TODO: finish plug
+		if (plug_started) {
+		blk_finish_plug(&plug);
+		plug_started = false;
+		}
+		*/
+#ifdef CONFIG_DEBUG_PAPP
+		pr_info("  [per_app_shrink_node] reclaimed %lu pages from this app\n",
+			nr_reclaimed);
+#endif
+
+		/* we failed to reclaim any page, advance reclaim state to prevent infinite loop */
+		if (!nr_reclaimed) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("  [per_app_shrink_node] failed to reclaim any page: advance state and continue\n");
+#endif
+			/* Advance reclaim state to prevent infinite loop on this app */
+			per_app_advance_reclaim_state(target_app);
+			continue; /* Try next app instead of breaking */
+		}
+	}
+
+	blk_finish_plug(&plug);
+
+	/*
+	* TODO: where to call shrink_slab()? 
+	pr_info("  About to call shrink_slab\nGFP: %pGg\tNode id: %d\t NULL: %d\tPriority: %d\n",
+		&sc->gfp_mask, pgdat->node_id, sc->target_mem_cgroup ? 1 : 0, sc->priority);
+	shrink_slab(sc->gfp_mask, pgdat->node_id, sc->target_mem_cgroup, sc->priority);
+	pr_info("  shrink_slab done\n");
+	*/
+
+#ifdef CONFIG_DEBUG_PAPP
+	pr_info("  [per_app_shrink_node]: TOTAL nr_to_reclaim: %lu\t nr_scanned: %lu\t nr_reclaimed: %lu\n",
+		sc->nr_to_reclaim, sc->nr_scanned, sc->nr_reclaimed);
+#endif
+	pr_info("  [per_app_shrink_node]: TOTAL nr_to_reclaim: %lu\t nr_scanned: %lu\t nr_reclaimed: %lu\n",
+		sc->nr_to_reclaim, sc->nr_scanned, sc->nr_reclaimed);
+
+	//out:
+	trace_per_app_shrink_node(sc->nr_to_reclaim, sc->nr_scanned,
+				  sc->nr_reclaimed);
+	return sc->nr_scanned >= sc->nr_to_reclaim;
+}
+
+#endif /* CONFIG_PAPP */
+// ------------------------- end of perapp reclaim ------------------------
+
 /*
  * For kswapd, balance_pgdat() will reclaim pages across a node from zones
  * that are eligible for use by the caller until at least one zone is
@@ -7527,6 +8370,9 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 		.may_unmap = 1,
 	};
 
+	// custom perapp tracing
+	//trace_balance_pgdat_begin(rdtsc());
+
 	set_task_reclaim_state(current, &sc.reclaim_state);
 	psi_memstall_enter(&pflags);
 	__fs_reclaim_acquire(_THIS_IP_);
@@ -7551,6 +8397,16 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 
 restart:
 	set_reclaim_active(pgdat, highest_zoneidx);
+
+#ifdef CONFIG_PAPP
+	sc.may_writepage = 1; // enable zRAM swap out
+	sc.reclaim_idx = highest_zoneidx;
+	if (per_app_shrink_node(pgdat, &sc)) {
+		goto out;
+		// if not enough memory has been reclaimed, continue with default reclaim
+	}
+#endif /* CONFIG_PAPP */
+
 	sc.priority = DEF_PRIORITY;
 	do {
 		unsigned long nr_reclaimed = sc.nr_reclaimed;
@@ -7718,6 +8574,9 @@ out:
 	 * entered the allocator slow path while kswapd was awake, order will
 	 * remain at the higher level.
 	 */
+
+	// custom perapp tracing
+	trace_balance_pgdat_end(rdtsc(), sc.nr_reclaimed);
 	return sc.order;
 }
 

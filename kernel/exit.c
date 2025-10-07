@@ -75,6 +75,10 @@
 #include <trace/hooks/mm.h>
 #include <trace/hooks/dtask.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 /*
  * The default value should be high enough to not crash a system that randomly
  * crashes its kernel from time to time, but low enough to at least not permit
@@ -885,6 +889,10 @@ void __noreturn do_exit(long code)
 	exit_task_namespaces(tsk);
 	exit_task_work(tsk);
 	exit_thread(tsk);
+
+#ifdef CONFIG_PAPP
+	per_app_process_exit(tsk);
+#endif
 
 	sched_autogroup_exit_task(tsk);
 	cgroup_exit(tsk);

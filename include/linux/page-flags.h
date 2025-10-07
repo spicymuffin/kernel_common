@@ -138,6 +138,9 @@ enum pageflags {
 #ifdef CONFIG_KASAN_HW_TAGS
 	PG_skip_kasan_poison,
 #endif
+#ifdef CONFIG_PAPP
+  	PG_per_app,
+#endif
 #ifdef CONFIG_64BIT
 	PG_oem_reserved_1,
 	PG_oem_reserved_2,
@@ -508,6 +511,15 @@ PAGEFLAG(Reserved, reserved, PF_NO_COMPOUND)
 PAGEFLAG(SwapBacked, swapbacked, PF_NO_TAIL)
 	__CLEARPAGEFLAG(SwapBacked, swapbacked, PF_NO_TAIL)
 	__SETPAGEFLAG(SwapBacked, swapbacked, PF_NO_TAIL)
+
+// per-app page flag
+#ifdef CONFIG_PAPP
+PAGEFLAG(PerApp, per_app, PF_ANY)
+	__CLEARPAGEFLAG(PerApp, per_app, PF_ANY)
+	__SETPAGEFLAG(PerApp, per_app, PF_ANY)
+	TESTCLEARFLAG(PerApp, per_app, PF_ANY)
+	TESTSETFLAG(PerApp, per_app, PF_ANY)
+#endif
 
 /*
  * Private page markings that may be used by the filesystem that owns the page

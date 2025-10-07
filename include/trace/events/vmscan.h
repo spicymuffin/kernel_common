@@ -494,6 +494,67 @@ TRACE_EVENT(mm_vmscan_throttled,
 		__entry->usec_delayed,
 		show_throttle_flags(__entry->reason))
 );
+
+// custom tracepoint for tracing per_app_shrink_node
+TRACE_EVENT(per_app_shrink_node,
+	TP_PROTO(unsigned long nr_to_reclaim, unsigned long nr_scanned, unsigned long nr_reclaimed),
+
+	TP_ARGS(nr_to_reclaim, nr_scanned, nr_reclaimed),
+
+	TP_STRUCT__entry(
+		__field(unsigned long, nr_to_reclaim)
+		__field(unsigned long, nr_scanned)
+		__field(unsigned long, nr_reclaimed)
+	),
+
+	TP_fast_assign(
+		__entry->nr_to_reclaim = nr_to_reclaim;
+		__entry->nr_scanned = nr_scanned;
+		__entry->nr_reclaimed = nr_reclaimed;
+	),
+
+	TP_printk("target is %lu, scanned %lu, reclaimed %lu pages",
+		__entry->nr_to_reclaim,
+		__entry->nr_scanned,
+		__entry->nr_reclaimed
+	)
+);
+
+// custom tracepoint for tracing balance_pgdat
+TRACE_EVENT(balance_pgdat_begin,
+	TP_PROTO(u64 cycles),
+
+	TP_ARGS(cycles),
+
+	TP_STRUCT__entry(
+		__field(u64, cycles)
+	),
+
+	TP_fast_assign(__entry->cycles = cycles;),
+	TP_printk("balance_pgdat_begin %llu cycles", __entry->cycles)
+);
+
+TRACE_EVENT(balance_pgdat_end,
+	TP_PROTO(u64 cycles, unsigned long nr_reclaimed),
+
+	TP_ARGS(cycles, nr_reclaimed),
+
+	TP_STRUCT__entry(
+		__field(u64, cycles)
+		__field(unsigned long, nr_reclaimed)
+	),
+
+	TP_fast_assign(
+		__entry->cycles = cycles;
+		__entry->nr_reclaimed = nr_reclaimed;
+	),
+
+	TP_printk("balance_pgdat_end %llu cycles, reclaimed %lu pages",
+		__entry->cycles,
+		__entry->nr_reclaimed
+	)
+);
+
 #endif /* _TRACE_VMSCAN_H */
 
 /* This part must be outside protection */

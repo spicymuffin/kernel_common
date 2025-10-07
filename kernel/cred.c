@@ -17,6 +17,10 @@
 #include <linux/cn_proc.h>
 #include <linux/uidgid.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 #include <trace/hooks/creds.h>
 
 #if 0
@@ -452,6 +456,10 @@ int commit_creds(struct cred *new)
 	struct task_struct *task = current;
 	const struct cred *old = task->real_cred;
 
+#ifdef CONFIG_PAPP
+	struct per_app *app;
+#endif
+
 	kdebug("commit_creds(%p{%d,%d})", new,
 	       atomic_read(&new->usage),
 	       read_cred_subscribers(new));
@@ -506,6 +514,32 @@ int commit_creds(struct cred *new)
 	if (new->user != old->user || new->user_ns != old->user_ns)
 		dec_rlimit_ucounts(old->ucounts, UCOUNT_RLIMIT_NPROC, 1);
 	alter_cred_subscribers(old, -2);
+
+#ifdef CONFIG_PAPP
+	/* Debug: Print UID changes for per-app debugging */
+	if (!uid_eq(old->uid, new->uid) &&
+	    per_app_is_target_uid(from_kuid(&init_user_ns, new->uid))) {
+		pr_info("[per-app-debug] commit_creds: PID %d (%s) UID change: old_uid=%d old_euid=%d -> new_uid=%d new_euid=%d\n",
+			task->pid, task->comm,
+			from_kuid(&init_user_ns, old->uid),
+			from_kuid(&init_user_ns, old->euid),
+			from_kuid(&init_user_ns, new->uid),
+			from_kuid(&init_user_ns, new->euid));
+
+		/* If no per_app struct exists for the new UID, create one */
+		app = per_app_find(new->uid);
+		if (!app) {
+			pr_info("[per-app-debug] commit_creds: Creating per_app struct for PID %d with UID %d\n",
+				task->pid, from_kuid(&init_user_ns, new->uid));
+			app = per_app_create(task);
+		} else {
+			/* Update per-app cache after credentials are committed */
+			pr_info("[per-app-debug] commit_creds: Updating per-app cache for PID %d after UID change\n",
+				task->pid);
+			per_app_update_cached(task);
+		}
+	}
+#endif
 
 	/* send notifications */
 	if (!uid_eq(new->uid,   old->uid)  ||

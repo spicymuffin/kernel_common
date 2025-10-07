@@ -107,6 +107,10 @@
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 #include <trace/events/sched.h>
 
 #define CREATE_TRACE_POINTS
@@ -2695,6 +2699,10 @@ static __latent_entropy struct task_struct *copy_process(
 	uprobe_copy_process(p, clone_flags);
 
 	copy_oom_score_adj(clone_flags, p);
+
+#ifdef CONFIG_PAPP
+	per_app_process_fork(current, p);
+#endif
 
 	return p;
 

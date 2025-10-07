@@ -98,6 +98,10 @@
 #include "swap.h"
 #include <trace/hooks/mm.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
 #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
 #endif
@@ -4234,6 +4238,10 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	vm_fault_t ret = 0;
 	pte_t entry;
 
+#ifdef CONFIG_PAPP
+	struct per_app *app;
+#endif
+
 	/* File mapping without ->vm_ops ? */
 	if (vma->vm_flags & VM_SHARED)
 		return VM_FAULT_SIGBUS;
@@ -4320,7 +4328,42 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	}
 
 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+	/*
+	#ifdef CONFIG_PAPP
+			app = per_app_get_current();
+			if (app) {
+				per_app_add_new_anon_rmap_vma(page, vma, vmf->address);
+				per_app_add_page_vma(page, vma, app);
+	#ifdef CONFIG_PAPP_USE_KREF
+				per_app_put(app);
+	#endif
+				goto setpte;
+			}
+	#endif
+	*/
 	page_add_new_anon_rmap(page, vma, vmf->address);
+#ifdef CONFIG_PAPP
+	/* temp: only adding per-app page to list, no rmap */
+	app = per_app_get_current();
+	if (app) {
+		folio_lock(page_folio(page));
+
+		if (per_app_add_page_vma(page, vma, app)) {
+			// this is error: page could not be added.. handle this
+			pr_warn("[perapp] PAGE COULD NOT BE ADDED TO PAGE LIST\n");
+#ifdef CONFIG_PAPP_USE_KREF
+			per_app_put(app);
+#endif
+		}
+
+		folio_unlock(page_folio(page));
+
+#ifdef CONFIG_PAPP_USE_KREF
+		per_app_put(app);
+#endif
+		goto setpte;
+	}
+#endif
 	lru_cache_add_inactive_or_unevictable(page, vma);
 setpte:
 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);

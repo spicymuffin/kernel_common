@@ -43,6 +43,11 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/pagemap.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#include <linux/cred.h>
+#endif
+
 /* How many pages do we try to swap or page in/out together? */
 int page_cluster;
 
@@ -982,6 +987,10 @@ void release_pages(struct page **pages, int nr)
 	unsigned long flags = 0;
 	unsigned int lock_batch;
 
+#ifdef CONFIG_PAPP
+	struct per_app *app;
+#endif
+
 	for (i = 0; i < nr; i++) {
 		struct folio *folio = page_folio(pages[i]);
 
@@ -1022,6 +1031,40 @@ void release_pages(struct page **pages, int nr)
 			continue;
 		}
 
+#ifdef CONFIG_PAPP
+		if (folio_test_per_app(folio)) {
+			app = per_app_get_current();
+			if (app) {
+				folio_lock(folio);
+
+				// rare race condition
+				if (!folio_test_clear_per_app(folio)) {
+					goto check_lru;
+				}
+
+				per_app_remove_page(app, folio_page(folio, 0));
+				//folio_clear_per_app(folio);
+				if (folio_test_lru(folio))
+					pr_warn("[perapp] THIS PAGE IS BOTH IN PER-APP AND LRU\n");
+#ifdef CONFIG_PAPP_USE_KREF
+				per_app_put(app);
+#endif
+				folio_unlock(folio);
+
+				goto skip_lru_del;
+			} else {
+				// how come there is no per_app? What is this process?
+				pr_warn("<<<<<<<APP: %s (uid %u, pid %d, app %p)>>>>>>>>>>>\n",
+					current->comm,
+					from_kuid(&init_user_ns,
+						  task_uid(current)),
+					current->pid, (void *)app);
+				BUG();
+			}
+		}
+check_lru:
+#endif
+
 		if (folio_test_lru(folio)) {
 			struct lruvec *prev_lruvec = lruvec;
 
@@ -1033,6 +1076,10 @@ void release_pages(struct page **pages, int nr)
 			lruvec_del_folio(lruvec, folio);
 			__folio_clear_lru_flags(folio);
 		}
+
+#ifdef CONFIG_PAPP
+skip_lru_del:
+#endif
 
 		list_add(&folio->lru, &pages_to_free);
 	}
