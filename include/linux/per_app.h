@@ -111,21 +111,23 @@ struct per_app_manager {
 static inline struct vm_area_struct *per_app_folio_vma(struct folio *folio)
 {
 	unsigned long mapping = (unsigned long)folio->mapping;
-	struct vm_area_struct *vma;
+	// struct vm_area_struct *vma;
 
-	if (!(mapping & PAGE_MAPPING_ANON)) {
-		WARN(1, "[per_app_folio_vma] per-app has no VMA\n");
+	if (!mapping)
+		BUG();
+
+	// if (!(mapping & PAGE_MAPPING_ANON)) {
+	// 	pr_err("[per_app_folio_vma] per-app has no VMA: mapping=0x%lx, PAGE_MAPPING_ANON=0x%x\n",
+	// 	       mapping, PAGE_MAPPING_ANON);
+	// 	WARN(1, "[per_app_folio_vma] per-app has no VMA\n");
+	// 	return NULL;
+	// }
+
+	if ((mapping & PAGE_MAPPING_FLAGS) != PAGE_MAPPING_ANON) {
 		return NULL;
 	}
 
-	vma = (struct vm_area_struct *)(mapping & ~PAGE_MAPPING_FLAGS);
-
-	if (unlikely(!vma || !vma->vm_mm)) {
-		WARN(1, "[per_app_folio_vma] Invalid VMA\n");
-		return NULL;
-	}
-
-	return vma;
+	return (void *)(mapping - PAGE_MAPPING_ANON);
 }
 
 /*
@@ -148,7 +150,7 @@ static inline void __per_app_set_cached(struct task_struct *task,
 /**
  * per_app_get_cached - Retrieve per_app pointer from task's vendor data
  * @task: The task_struct to read from
- * 
+ *
  * Returns: Pointer to per_app struct, or NULL if not set
  */
 static inline struct per_app *__per_app_get_cached(struct task_struct *task)
@@ -168,7 +170,7 @@ static inline void __per_app_clear_cached(struct task_struct *task)
 /**
  * per_app_is_cached - Check if task has cached per_app pointer
  * @task: The task_struct to check
- * 
+ *
  * Returns: true if cached pointer exists, false otherwise
  */
 static inline bool __per_app_is_cached(struct task_struct *task)
