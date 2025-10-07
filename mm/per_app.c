@@ -26,9 +26,19 @@ const unsigned long reclaim_ratio[] = {
 
 const uid_t target_app_uids[] = {
 	10152, // deskclock
-	//10193, // instagram
-	//10194, // thread
+	10154, // google maps
+	10192, // instagram
+	10193, // thread
 };
+/*
+	10194, // ebay
+	10195, // worm game
+	10196, // pinterest
+	10197, // fruitninja
+	10198, // facebook
+	10199, // firefox
+};
+*/
 const size_t num_target_app_uids = ARRAY_SIZE(target_app_uids);
 
 /* global per-app manager */
@@ -312,6 +322,12 @@ void per_app_set_anon_rmap_vma(struct page *page, struct vm_area_struct *vma,
 	struct vm_area_struct *page_vma = vma;
 	if (PageAnon(page))
 		goto out;
+
+	if (!vma)
+		BUG();
+	if (!vma->vm_mm)
+		BUG();
+
 	page_vma = (void *)page_vma + PAGE_MAPPING_ANON;
 	WRITE_ONCE(page->mapping, (struct address_space *)page_vma);
 	page->index = linear_page_index(vma, address);
@@ -418,6 +434,8 @@ void per_app_add_anon_rmap_vma(struct page *page, struct vm_area_struct *vma,
  */
 void per_app_restore_anon_rmap(struct page *page, struct vm_area_struct *vma)
 {
+	if (!vma)
+		BUG();
 	/* restore anonymous page mapping (anon_vma) for this page */
 	if (PageAnon(page) && vma && vma->anon_vma) {
 		struct folio *folio = page_folio(page);
@@ -641,9 +659,9 @@ void per_app_process_exit(struct task_struct *task)
 	nr_processes = atomic_dec_return(&app->nr_processes);
 	per_app_clear_cached(task);
 	/*
-  pr_info("[perapp]: exiting (%s) uid %u\n",
-   app->app_name, from_kuid(&init_user_ns, app->uid));
-  */
+	pr_info("[perapp]: exiting (%s) uid %u\n",
+	app->app_name, from_kuid(&init_user_ns, app->uid));
+	*/
 #ifdef CONFIG_PAPP_USE_KREF
 	if (nr_processes == 0) {
 		per_app_put(app); /* from __per_app_get_cached() */
@@ -653,7 +671,8 @@ void per_app_process_exit(struct task_struct *task)
 	}
 #else
 	if (nr_processes == 0) {
-		//pr_info("[perapp] LAST process (%s) exit, releasing per_app\n", app->app_name);
+		pr_info("[perapp] LAST process (%s) exit, releasing per_app\n",
+			app->app_name);
 		per_app_release(app);
 	}
 #endif
@@ -891,9 +910,16 @@ void per_app_process_fork(struct task_struct *parent, struct task_struct *child)
 	} else {
 		// per_app already exists
 
-		pr_info("    [perapp]: per_app alread exists for app %s (uid %u, pid %d)\n",
-			child->comm, from_kuid(&init_user_ns, child_uid),
-			child->pid);
+		// pr_info("    [perapp]: per_app alread exists for app %s (uid %u, pid %d)\n",
+		// 	child->comm, from_kuid(&init_user_ns, child_uid),
+		// 	child->pid);
+
+		// if app name is still "main", update it with the actual app name
+		if (unlikely(strcmp(app->app_name, "main") == 0 &&
+			     strcmp(child->comm, "main") != 0)) {
+			strncpy(app->app_name, child->comm, TASK_COMM_LEN - 1);
+			app->app_name[TASK_COMM_LEN - 1] = '\0';
+		}
 
 		atomic_inc(&app->nr_processes);
 		/* Cache the per_app pointer for the child process */
