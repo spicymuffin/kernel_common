@@ -105,6 +105,10 @@
 #include "internal.h"
 #include "fd.h"
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 #include "../../lib/kstrtox.h"
 
 /* NOTE:
@@ -1184,6 +1188,10 @@ static int __set_oom_adj(struct file *file, int oom_adj, bool legacy)
 	if (!legacy && has_capability_noaudit(current, CAP_SYS_RESOURCE))
 		task->signal->oom_score_adj_min = (short)oom_adj;
 	trace_oom_score_adj_update(task);
+
+#ifdef CONFIG_PAPP
+	per_app_try_to_update_position(task, oom_adj);
+#endif
 
 	if (mm) {
 		struct task_struct *p;

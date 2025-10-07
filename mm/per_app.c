@@ -25,10 +25,13 @@ const unsigned long reclaim_ratio[] = {
 };
 
 const uid_t target_app_uids[] = {
+	10150, 10151,
 	10152, // deskclock
+	10153,
 	10154, // google maps
 	10192, // instagram
 	10193, // thread
+	10194, 10195, 10196,
 };
 /*
 	10194, // ebay
@@ -48,10 +51,10 @@ static struct per_app_manager global_app_manager;
 #define PER_APP_HASH_BITS 8
 #define PER_APP_HASH_SIZE (1 << PER_APP_HASH_BITS)
 
-/* hash function for uid */
-static inline unsigned int uid_hash(kuid_t uid)
+/* hash function for pid */
+static inline unsigned int pid_hash(pid_t pid)
 {
-	return hash_32(from_kuid(&init_user_ns, uid), PER_APP_HASH_BITS);
+	return hash_32(pid, PER_APP_HASH_BITS);
 }
 
 /*
@@ -69,14 +72,14 @@ int per_app_manager_init(void)
 	atomic_set(&global_app_manager.nr_apps, 0);
 
 	/* initialize global hash table */
-	global_app_manager.uid_hash = kmalloc_array(
+	global_app_manager.pid_hash = kmalloc_array(
 		PER_APP_HASH_SIZE, sizeof(struct hlist_head), GFP_KERNEL);
-	if (!global_app_manager.uid_hash) {
+	if (!global_app_manager.pid_hash) {
 		pr_err("[perapp]: failed to allocate global hash table\n");
 		return -ENOMEM;
 	}
 	for (i = 0; i < PER_APP_HASH_SIZE; i++)
-		INIT_HLIST_HEAD(&global_app_manager.uid_hash[i]);
+		INIT_HLIST_HEAD(&global_app_manager.pid_hash[i]);
 	global_app_manager.hash_bits = PER_APP_HASH_BITS;
 	spin_lock_init(&global_app_manager.hash_lock);
 
@@ -103,19 +106,8 @@ void per_app_manager_exit(void)
 	spin_unlock(&global_app_manager.app_list_lock);
 
 	/* free hash table */
-	kfree(global_app_manager.uid_hash);
-	global_app_manager.uid_hash = NULL;
-}
-
-/*
- * this function should be used for QEMU testing
- * returns uid + pid for current task
- */
-kuid_t per_app_get_current_uid(void)
-{
-	kuid_t current_uid = current_uid();
-	return make_kuid(&init_user_ns, (from_kuid(&init_user_ns, current_uid) +
-					 current->pid));
+	kfree(global_app_manager.pid_hash);
+	global_app_manager.pid_hash = NULL;
 }
 
 /*
@@ -127,6 +119,7 @@ void per_app_clear_cached(struct task_struct *task)
 	__per_app_clear_cached(task);
 }
 
+// TODO: technically we don't need this, since per_app <-> task relationship is permanent.
 /*
  * Update cached per_app pointer for a task
  * This should be called when a task's credentials change
@@ -134,6 +127,7 @@ void per_app_clear_cached(struct task_struct *task)
 void per_app_update_cached(struct task_struct *task)
 {
 	kuid_t uid;
+	pid_t pid;
 	struct per_app *app;
 
 	/* Clear old cached pointer */
@@ -141,11 +135,12 @@ void per_app_update_cached(struct task_struct *task)
 
 	/* Find and cache new per_app pointer */
 	uid = task_uid(task);
-	app = per_app_find(uid);
+	pid = task_tgid_nr(task);
+	app = per_app_find(pid);
 
 	/* Debug: Print cache update information */
-	pr_info("[per-app-debug] per_app_update_cached: PID %d (%s) UID %d, found app=%p\n",
-		task->pid, task->comm, from_kuid(&init_user_ns, uid), app);
+	pr_info("[per-app-debug] per_app_update_cached: PID %u (%s) UID %d, found app=%p\n",
+		pid, task->comm, from_kuid(&init_user_ns, uid), app);
 
 	if (app) {
 		__per_app_set_cached(task, app);
@@ -196,6 +191,7 @@ struct per_app *per_app_create(struct task_struct *task)
 	struct per_app *app;
 	unsigned int hash;
 	kuid_t uid = task_uid(task);
+	pid_t pid = task_tgid_nr(task);
 	const char *name = task->comm;
 
 	app = kzalloc(sizeof(*app), GFP_KERNEL);
@@ -209,6 +205,8 @@ struct per_app *per_app_create(struct task_struct *task)
 		return NULL;
 
 	app->uid = uid;
+	app->pid = pid;
+
 	strncpy(app->app_name, name, TASK_COMM_LEN - 1);
 	INIT_LIST_HEAD(&app->page_list);
 	spin_lock_init(&app->page_list_lock);
@@ -218,11 +216,13 @@ struct per_app *per_app_create(struct task_struct *task)
 	atomic_long_set(&app->nr_reclaimed, 0);
 	atomic_long_set(&app->nr_anon_reclaimed, 0);
 	atomic_long_set(&app->nr_file_reclaimed, 0);
-	atomic_set(&app->nr_processes, 1);
+	// atomic_set(&app->nr_processes, 1);
+	atomic_set(&app->nr_tasks, 1);
+	app->reclaim_state = RECLAIM_STATE_R0;
+
 #ifdef CONFIG_PAPP_USE_KREF
 	kref_init(&app->kref); // initial refcount is 1
 #endif
-	app->reclaim_state = RECLAIM_STATE_R0;
 
 	// add this per_app to the head of global app list
 	spin_lock(&global_app_manager.app_list_lock);
@@ -231,41 +231,40 @@ struct per_app *per_app_create(struct task_struct *task)
 	spin_unlock(&global_app_manager.app_list_lock);
 
 	// add this per_app to global hash-table
-	hash = uid_hash(uid);
+	hash = pid_hash(pid);
 	spin_lock(&global_app_manager.hash_lock);
-	hlist_add_head(&app->hash_node, &global_app_manager.uid_hash[hash]);
+	hlist_add_head(&app->hash_node, &global_app_manager.pid_hash[hash]);
 	spin_unlock(&global_app_manager.hash_lock);
 
 	// link the per_app struct to task
 	__per_app_set_cached(task, app);
 
-#ifdef CONFIG_DEBUG_PAPP
-	pr_info("[perapp]: created per_app struct for uid %u (%s)\n",
-		from_kuid(&init_user_ns, uid), app->app_name);
-#endif
+	pr_info("[per_app_create]: created per_app struct for uid %u pid %u (%s)\n",
+		from_kuid(&init_user_ns, uid), app->pid, app->app_name);
+
 	return app;
 }
 
 /*
- * find per_app using uid
+ * find per_app using pid
  * returns struct with incremented ref count
  * this function increments per_app refcount if app was found
  * caller should correctly decrement refcount when done using it
  */
-struct per_app *per_app_find(kuid_t uid)
+struct per_app *per_app_find(pid_t pid)
 {
 	struct per_app *app;
 	unsigned int hash;
 
 	/* check if system is initialized */
-	if (!global_app_manager.uid_hash)
+	if (!global_app_manager.pid_hash)
 		return NULL;
 
-	hash = uid_hash(uid);
+	hash = pid_hash(pid);
 	spin_lock(&global_app_manager.hash_lock);
-	hlist_for_each_entry(app, &global_app_manager.uid_hash[hash],
+	hlist_for_each_entry(app, &global_app_manager.pid_hash[hash],
 			     hash_node) {
-		if (uid_eq(app->uid, uid)) {
+		if (app->pid == pid) {
 #ifdef CONFIG_PAPP_USE_KREF
 			per_app_get(app); // increment ref count
 #endif
@@ -277,29 +276,32 @@ struct per_app *per_app_find(kuid_t uid)
 	return NULL;
 }
 
-/* REVERSE MAPPING */
-
 /*
- * per_app vesrsion of __page_set_anon_rmap()
+ * detect proc/<pid>/oom_score_adj write
+ * update the position of per_app struct in global app list
+ * frequently used apps will naturally move towards the head
  */
-void per_app_set_anon_rmap(struct page *page, unsigned long address,
-			   int exclusive, pte_t *pte)
+void per_app_try_to_update_position(struct task_struct *task, int oom)
 {
-	/*
-    pte_t *anon_pte = pte;
-    //void *anon_pte;
-    //BUG_ON(!pte);
-    if (PageAnon(page))
-        goto out;
-    //anon_pte = (void*)((unsigned long) pte | PAGE_MAPPING_ANON);
-    anon_pte = (void *) anon_pte + PAGE_MAPPING_ANON;
-    WRITE_ONCE(page->mapping, (struct address_space *) anon_pte);
-    page->index = address;
-    out:
-    if (exclusive)
-        SetPageAnonExclusive(page);
-    */
+	struct per_app *app;
+	app = per_app_get_cached(task);
+
+	if (!app)
+		return;
+
+	/* detect app switch: bg -> fg */
+	if (oom == 0) {
+		pr_info("[per_app_update_position] per_app with pid %u moved to head\n",
+			app->pid);
+		spin_lock(&global_app_manager.app_list_lock);
+		list_move(&app->app_list, &global_app_manager.app_list);
+		spin_unlock(&global_app_manager.app_list_lock);
+	}
+
+	return;
 }
+
+/* REVERSE MAPPING */
 
 /*
  * page sanity check
@@ -314,7 +316,7 @@ void per_app_page_check_anon_rmap(struct page *page, struct vm_area_struct *vma,
 }
 
 /*
- * per_app_set_anon_rmap, but use vma instead of pte
+ * set page->mapping to vma (instead of anon_vma)
  */
 void per_app_set_anon_rmap_vma(struct page *page, struct vm_area_struct *vma,
 			       unsigned long address, int exclusive)
@@ -534,19 +536,6 @@ void per_app_remove_page(struct per_app *app, struct page *page)
 		atomic_long_dec(&app->nr_anon_pages);
 	else
 		atomic_long_dec(&app->nr_file_pages);
-	/*
-    // haven't tried this yet..
-    if (!list_empty(&page->lru)) {
-        list_del_init(&page->lru);  // Use list_del_init for safety
-        atomic_long_dec(&app->nr_pages);
-        if (PageAnon(page))
-            atomic_long_dec(&app->nr_anon_pages);
-        else
-            atomic_long_dec(&app->nr_file_pages);
-    } else {
-        pr_warn("[perapp]: Trying to remove page %p that's not on any list\n", page);
-    }
-    */
 
 	spin_unlock(&app->page_list_lock);
 }
@@ -607,10 +596,6 @@ static void per_app_release(struct kref *kref)
 {
 	struct per_app *app = container_of(kref, struct per_app, kref);
 
-#ifdef CONFIG_DEBUG_PAPP
-	pr_info("[perapp]: releasing per_app for uid %u (%s)\n",
-		from_kuid(&init_user_ns, app->uid), app->app_name);
-#endif
 	/* remove from hash-table */
 	spin_lock(&global_app_manager.hash_lock);
 	hlist_del(&app->hash_node);
@@ -640,7 +625,7 @@ static void per_app_release(struct per_app *app)
 	spin_unlock(&global_app_manager.app_list_lock);
 
 	// for now, just skip freeing
-	//kfree(app);
+	kfree(app);
 }
 #endif
 
@@ -650,32 +635,38 @@ static void per_app_release(struct per_app *app)
 void per_app_process_exit(struct task_struct *task)
 {
 	struct per_app *app;
-	int nr_processes;
+	// int nr_processes;
+	int nr_tasks;
 
 	app = __per_app_get_cached(task);
 	if (!app)
 		return;
 
-	nr_processes = atomic_dec_return(&app->nr_processes);
+	nr_tasks = atomic_dec_return(&app->nr_tasks);
+
 	per_app_clear_cached(task);
-	/*
-	pr_info("[perapp]: exiting (%s) uid %u\n",
-	app->app_name, from_kuid(&init_user_ns, app->uid));
-	*/
-#ifdef CONFIG_PAPP_USE_KREF
-	if (nr_processes == 0) {
-		per_app_put(app); /* from __per_app_get_cached() */
-		per_app_put(app); /* from per_app_create() */
-	} else {
-		per_app_put(app); /* from __per_app_get_cached() */
-	}
-#else
-	if (nr_processes == 0) {
-		pr_info("[perapp] LAST process (%s) exit, releasing per_app\n",
-			app->app_name);
+	if (nr_tasks == 0) {
+		pr_info("[per_app_process_exit]: LAST task for perapp PID %u is exiting\n",
+			app->pid);
 		per_app_release(app);
 	}
-#endif
+
+	/*
+	if ((task_tgid_nr(task) == task_pid_nr(task)) && (task_tgid_nr(task) == app->pid)) {
+		// main thread exiting, delete per_app
+		nr_processes = atomic_dec_return(&app->nr_processes);
+		if (nr_processes == 0) {
+		if (nr_threads != 0)
+			WARN(1, "[per_app_process_exit]: main thread exiting, but there are still other tasks\n");
+		// delete per_app
+		per_app_clear_cached(task);
+		per_app_release(app);
+		}
+	} else {
+		// thread exit
+		per_app_clear_cached(task);
+	}
+	*/
 }
 
 /*
@@ -797,15 +788,14 @@ static int per_app_proc_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "Per-App Memory Management Statistics\n");
 	seq_printf(m, "====================================\n");
-	seq_printf(m, "Total apps tracked: %d\n\n",
-		   atomic_read(&global_app_manager.nr_apps));
 
 	spin_lock(&global_app_manager.app_list_lock);
 	list_for_each_entry(app, &global_app_manager.app_list, app_list) {
 		seq_printf(m, "UID: %u\n", from_kuid(&init_user_ns, app->uid));
+		seq_printf(m, "PID: %u\n", app->pid);
 		seq_printf(m, "App Name: %s\n", app->app_name);
-		seq_printf(m, "Active Processes: %d\n",
-			   atomic_read(&app->nr_processes));
+		seq_printf(m, "Active Tasks: %d\n",
+			   atomic_read(&app->nr_tasks));
 		seq_printf(m, "Total Pages: %ld\n",
 			   atomic_long_read(&app->nr_pages));
 		seq_printf(m, "  - Anonymous: %ld\n",
@@ -825,6 +815,11 @@ static int per_app_proc_show(struct seq_file *m, void *v)
 #endif
 		seq_printf(m, "---\n");
 	}
+
+	seq_printf(m, "Total apps tracked: %d\n\n",
+		   atomic_read(&global_app_manager.nr_apps));
+	seq_printf(m, "====================================\n");
+
 	spin_unlock(&global_app_manager.app_list_lock);
 
 	return 0;
@@ -864,71 +859,78 @@ static int __init per_app_create_proc_entry(void)
  */
 void per_app_process_fork(struct task_struct *parent, struct task_struct *child)
 {
-	// NOTE: this function has been modified for testing in QEMU
-	// notably, use uid+pid instead of uid
-	// so each process will get per_app, not each app
 	struct per_app *app;
 	kuid_t child_uid;
 
-	//return;
+	pid_t child_pid;
+	pid_t child_tid;
 
 	/* skip kernel threads */
 	if (!child->mm)
 		return;
 
 	child_uid = task_uid(child);
+	child_pid = task_tgid_nr(child);
+	child_tid = task_pid_nr(child);
 
-	// for testing, only filter out deskclock app for per-app
+	/* filter applications of interest */
+
 	//if (!uid_eq(child_uid, make_kuid(&init_user_ns, 10152)))
 	//  return;
 
-	// filter only user applications (UID > 10100)
 	//if (uid_lte(child_uid, make_kuid(&init_user_ns, 10100)))
 	//  return;
 
-	// filter out apps of interest
 	if (!per_app_is_target_uid(from_kuid(&init_user_ns, child_uid)))
 		return;
 
-	app = per_app_find(child_uid);
+	if (unlikely(child_pid == child_tid)) {
+		WARN(1,
+		     "[per_app_process_fork]: ERROR main task should already have per_app struct for UID: %u PID: %u\n",
+		     from_kuid(&init_user_ns, child_uid), child_pid);
+		BUG();
+	} else {
+		// find and link the per_app struct to this new task
+		app = per_app_find(child_pid);
+		if (app) {
+			__per_app_set_cached(child, app);
+			atomic_inc(&app->nr_tasks);
+			if (strcmp(app->app_name, "main") == 0) {
+				char name[TASK_COMM_LEN];
+				get_task_comm(name, parent); // or parent?
+				if (strcmp(name, "main") != 0) {
+					strncpy(app->app_name, name,
+						TASK_COMM_LEN - 1);
+					app->app_name[TASK_COMM_LEN - 1] = '\0';
+					pr_info("[per_app_process_fork]: updated name to %s\n",
+						app->app_name);
+				}
+			}
+#ifdef CONFIG_PAPP_USE_KREF
+			per_app_put(app);
+#endif
+		} else {
+			WARN(1,
+			     "[per_app_process_fork]: ERROR task should already have per_app struct for UID: %u PID: %u\n",
+			     from_kuid(&init_user_ns, child_uid), child_pid);
+		}
+	}
+
+	return;
+	/* main thread, create new per_app struct */
+	/*
+  	app = per_app_find(child_pid); // delete this later
 	if (!app) {
-		// new process
-
-		pr_info("    [perapp]: creating a NEW per_app for app %s (uid %u, pid %d)\n",
-			child->comm, from_kuid(&init_user_ns, child_uid),
-			child->pid);
-
 		app = per_app_create(child);
 		if (!app) {
-			pr_err("    [perapp]: failed to create per_app for app %s (uid %u, pid %d)\n",
-			       child->comm, from_kuid(&init_user_ns, child_uid),
-			       child->pid);
-
+			pr_err("    [perapp_process_fork]: failed to create per_app for app %s (uid %u, pid %u)\n", child->comm, from_kuid(&init_user_ns, child_uid), child_pid);
 			return;
 		}
-
 	} else {
-		// per_app already exists
-
-		// pr_info("    [perapp]: per_app alread exists for app %s (uid %u, pid %d)\n",
-		// 	child->comm, from_kuid(&init_user_ns, child_uid),
-		// 	child->pid);
-
-		// if app name is still "main", update it with the actual app name
-		if (unlikely(strcmp(app->app_name, "main") == 0 &&
-			     strcmp(child->comm, "main") != 0)) {
-			strncpy(app->app_name, child->comm, TASK_COMM_LEN - 1);
-			app->app_name[TASK_COMM_LEN - 1] = '\0';
-		}
-
-		atomic_inc(&app->nr_processes);
-		/* Cache the per_app pointer for the child process */
-		__per_app_set_cached(child, app);
-
-#ifdef CONFIG_PAPP_USE_KREF
-		per_app_put(app); // decrement reference from per_app_find()
-#endif
+		WARN(1, "[per_app_process_fork]: per_app for pid %u and tid %u already exists\n",
+        child_pid, child_tid);
 	}
+	*/
 }
 
 /*

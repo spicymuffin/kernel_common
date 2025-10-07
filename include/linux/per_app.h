@@ -57,10 +57,12 @@ extern const unsigned long reclaim_ratio[];
 
 /*
  * per-app memory management struct
- * one per each unique app (uid)
+ * one per each unique app process (uid: pid)
  */
 struct per_app {
 	kuid_t uid;
+	pid_t pid; // thread group id
+
 	char app_name[TASK_COMM_LEN];
 
 	struct list_head page_list; // head of page list
@@ -83,12 +85,14 @@ struct per_app {
 	struct list_head app_list;
 	struct hlist_node hash_node;
 
-	atomic_t nr_processes; // active processes for this app
+	// atomic_t nr_processes; // should be just 1. if 0, main thread exited
+	atomic_t nr_tasks; // including main thread
 
-	char package_name[256]; // com.app.android
-	int oom_score_adj;
-
-	unsigned long flags; // reclaim flags for this per-app
+	// these fields are not currently being used.. but maybe in the future
+	// char package_name[32]; // com.app.android
+	// char package_name[256]; // com.app.android
+	// int oom_score_adj;
+	// unsigned long flags; // reclaim flags for this per-app
 
 	reclaim_state_t reclaim_state;
 };
@@ -101,8 +105,8 @@ struct per_app_manager {
 	spinlock_t app_list_lock;
 	atomic_t nr_apps;
 
-	// hash-table for faster lookup (uid -> struct per_app)
-	struct hlist_head *uid_hash;
+	// hash-table for faster lookup (pid -> struct per_app)
+	struct hlist_head *pid_hash;
 	unsigned int hash_bits;
 	spinlock_t hash_lock;
 };
@@ -193,9 +197,10 @@ static inline void __per_app_init_vendor_data(struct task_struct *task)
 #define APP_PAGE_DIRTY (1 << 2)
 
 struct per_app *per_app_create(struct task_struct *task);
-struct per_app *per_app_find(kuid_t uid);
+struct per_app *per_app_find(pid_t pid);
 
 bool per_app_is_target_uid(uid_t uid);
+void per_app_try_to_update_position(struct task_struct *task, int oom);
 
 #ifdef CONFIG_PAPP_USE_KREF
 struct per_app *per_app_get(struct per_app *app);
@@ -234,8 +239,6 @@ struct per_app *per_app_get_cached(struct task_struct *task);
 bool per_app_is_cached(struct task_struct *task);
 
 // reverse mapping
-void per_app_set_anon_rmap(struct page *page, unsigned long address,
-			   int exclusive, pte_t *pte);
 void per_app_add_new_anon_rmap_vma(struct page *page,
 				   struct vm_area_struct *vma,
 				   unsigned long address);
