@@ -35,6 +35,13 @@ extern const size_t num_target_app_uids;
 // maximum number of pages to scan per app
 #define APP_CLUSTER_MAX 1024
 
+#define PATHSTR_LEN 256
+#define PACKAGE_NAME_LEN 256
+
+#define TEMP_HOME_PATHSTR "/var/tmp" // tmp pathstr for apps without home dir
+
+#define OVERRIDE_HOME_PATHSTR 1
+
 // which type of page to reclaim?
 enum per_app_reclaim_type {
 	RECLAIM_ANON,
@@ -52,6 +59,35 @@ typedef enum {
 	RECLAIM_STATE_OOM = 5, /* candidate for termination, OOM */
 } reclaim_state_t;
 
+#define HOME_BIT(t) (1U << (t))
+
+enum home_type { HOME_CE, HOME_DE, HOME_NR };
+
+static_assert(HOME_NR <= 32, "bitmap too small for HOME_NR");
+
+struct home_entry {
+	struct dentry *root;
+	enum home_type type;
+	char path[PATHSTR_LEN];
+};
+
+struct home_dentry_cache {
+	struct rw_semaphore rwsem;
+
+	struct home_entry slots[HOME_NR];
+	u32 bitmap;
+};
+
+// RCU: https://lwn.net/Articles/262464/
+
+struct inode_tag {
+	struct rhash_head hnode; // in-hashtable linkage
+	struct inode *inode; // address of tagged inode
+	struct per_app *owner; // the app/UID that owns this inode
+	struct rcu_head rcu; // for RCU freeing
+	enum home_type type; // which home this inode belongs to
+};
+
 // app->nr_pages >> reclaim_ratio[i]
 extern const unsigned long reclaim_ratio[];
 
@@ -66,7 +102,10 @@ struct per_app {
 	char app_name[TASK_COMM_LEN];
 
 	struct list_head page_list; // head of page list
+	struct list_head filepage_list; // head of file page list
+
 	spinlock_t page_list_lock; // spinlock for page list
+	spinlock_t filepage_list_lock; // spinlock for file page list
 
 	atomic_long_t nr_pages; // present in RAM? or including swap?
 	atomic_long_t nr_anon_pages;
@@ -84,6 +123,8 @@ struct per_app {
 	// global linkage
 	struct list_head app_list;
 	struct hlist_node hash_node;
+
+	struct home_dentry_cache home;
 
 	// atomic_t nr_processes; // should be just 1. if 0, main thread exited
 	atomic_t nr_tasks; // including main thread
@@ -259,6 +300,41 @@ extern void setup_scan_control_advanced(enum per_app_reclaim_type type,
 					unsigned long nr_to_reclaim,
 					bool aggressive,
 					struct mem_cgroup *memcg);
+
+// home_dentry_cache management
+void per_app_home_dentry_cache_init(struct per_app *app);
+void per_app_home_dentry_cache_destroy(struct per_app *app);
+
+// resolution to dentry
+int resolve_dir(const char *path, struct dentry **out);
+
+// setting home_entry(s) inside the home_dentry_cache
+int per_app_home_entry_set(struct per_app *app, enum home_type type,
+			   const char *pathstr);
+int per_app_home_entry_clear(struct per_app *app, enum home_type type);
+
+// inode tagging
+// TODO: i dont think all these functions need to be exposed in the header
+int inode_tag_ht_init(void);
+void inode_tag_ht_destroy(void);
+
+void inode_tag_free_rcu(struct rcu_head *rcu);
+void inode_tag_free_elem(void *ptr, void *arg);
+
+// path matching
+int per_app_home_match_dentry(struct per_app *app, struct dentry *leaf,
+			      enum home_type *out_type);
+int per_app_home_match_inode(struct per_app *app, struct inode *inode,
+			     enum home_type *out_type);
+
+// instrumentation hooks
+void per_app_do_dentry_open_instrument(struct file *f);
+void per_app_destroy_inode_instrument(struct inode *inode);
+
+int per_app_filemap_add_folio_instrument(struct address_space *mapping,
+					 struct folio *folio);
+int per_app_filemap_remove_folio_instrument(struct address_space *mapping,
+					    struct folio *folio);
 
 // macros
 #define for_each_app_page(pos, app) \

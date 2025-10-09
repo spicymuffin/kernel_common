@@ -7834,11 +7834,11 @@ static unsigned int per_app_shrink_app(struct list_head *folio_list,
 
 			try_to_unmap_flush_dirty();
 			/*
-      pageout_t pageout_res = pageout(folio, mapping, &plug);
-      pr_info("[perapp reclaim]: pageout result is %s\n",
-        pageout_result_to_str(pageout_res));
-      switch (pageout_res) {
-      */
+			pageout_t pageout_res = pageout(folio, mapping, &plug);
+			pr_info("[perapp reclaim]: pageout result is %s\n",
+				pageout_result_to_str(pageout_res));
+			switch (pageout_res) {
+			*/
 			switch (pageout(folio, mapping, &plug)) {
 			case PAGE_KEEP:
 #ifdef CONFIG_DEBUG_PAPP

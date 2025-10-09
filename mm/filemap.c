@@ -47,6 +47,10 @@
 #include <asm/tlbflush.h>
 #include "internal.h"
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/filemap.h>
 
@@ -978,6 +982,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 {
 	void *shadow = NULL;
 	int ret;
+	int r;
 
 	__folio_set_locked(folio);
 	ret = __filemap_add_folio(mapping, folio, index, gfp, &shadow);
@@ -995,8 +1000,24 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 		WARN_ON_ONCE(folio_test_active(folio));
 		if (!(gfp & __GFP_WRITE) && shadow)
 			workingset_refault(folio, shadow);
+
+#ifdef CONFIG_PAPP
+		// 0 = tagged, moved to perapp
+		// 1 = untagged, stay in global
+		// <0 = error
+		// this is dirty like this because we need to be able to compile out this config_papp section...
+		r = per_app_filemap_add_folio_instrument(mapping, folio);
+		if (r == 0) {
+			goto out;
+		} else if (unlikely(r < 0)) {
+			pr_err("per_app_filemap_add_folio_instrument error\n");
+			// proceed, because per_app_filemap_add_folio_instrument already cleaned up
+		}
+#endif
 		folio_add_lru(folio);
 	}
+
+out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(filemap_add_folio);

@@ -11,9 +11,12 @@
 #include <linux/cred.h>
 #include <linux/mm.h>
 #include <linux/sched/signal.h>
+#include <linux/rhashtable.h>
+#include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/swap.h>
+#include <linux/namei.h>
 #include "internal.h"
 
 const unsigned long reclaim_ratio[] = {
@@ -32,6 +35,11 @@ const uid_t target_app_uids[] = {
 	10192, // instagram
 	10193, // thread
 	10194, 10195, 10196,
+
+	10061, // calendar
+	10062, // camera
+	10058, // contacts
+	10064, // gallery
 };
 /*
 	10194, // ebay
@@ -42,10 +50,12 @@ const uid_t target_app_uids[] = {
 	10199, // firefox
 };
 */
+
 const size_t num_target_app_uids = ARRAY_SIZE(target_app_uids);
 
 /* global per-app manager */
 static struct per_app_manager global_app_manager;
+static bool per_app_ready;
 
 /* hash-table size: should be no more than 100 in theory */
 #define PER_APP_HASH_BITS 8
@@ -806,7 +816,7 @@ static int per_app_proc_show(struct seq_file *m, void *v)
 			   atomic_long_read(&app->nr_reclaimed));
 		seq_printf(m, "  - Reclaimed Anonymous: %ld\n",
 			   atomic_long_read(&app->nr_anon_reclaimed));
-		seq_printf(m, "  - ReclaimedFile-backed: %ld\n",
+		seq_printf(m, "  - Reclaimed File-backed: %ld\n",
 			   atomic_long_read(&app->nr_file_reclaimed));
 		seq_printf(m, "App reclaim state: R%d\n", app->reclaim_state);
 #ifdef CONFIG_PAPP_USE_KREF
@@ -1128,6 +1138,13 @@ int __init per_app_init_subsystem(void)
 		return ret;
 	}
 
+	ret = inode_tag_ht_init();
+	if (ret) {
+		pr_err("[perapp]: Failed to initialize inode tag ht: %d\n",
+		       ret);
+		return ret;
+	}
+
 #ifdef CONFIG_PROC_FS
 	ret = per_app_create_proc_entry();
 	if (ret)
@@ -1139,8 +1156,526 @@ int __init per_app_init_subsystem(void)
 
 	pr_info("[perapp]: Subsystem initialization complete. Tracking %d apps\n",
 		atomic_read(&global_app_manager.nr_apps));
+
+	smp_store_release(&per_app_ready, true);
+
 	return 0;
 }
+
+#pragma region home_path_management
+
+void per_app_home_dentry_cache_init(struct per_app *app)
+{
+	init_rwsem(&app->home.rwsem);
+	app->home.bitmap = 0;
+	for (int i = 0; i < HOME_NR; i++) {
+		app->home.slots[i].root = NULL;
+		app->home.slots[i].type = i;
+		app->home.slots[i].path[0] = '\0';
+	}
+}
+
+void per_app_home_dentry_cache_destroy(struct per_app *app)
+{
+	struct dentry *old[HOME_NR];
+	u32 bm;
+
+	down_write(&app->home.rwsem);
+	bm = app->home.bitmap;
+	for (int i = 0; i < HOME_NR; i++) {
+		old[i] = (bm & HOME_BIT(i)) ? app->home.slots[i].root : NULL;
+		app->home.slots[i].root = NULL;
+		app->home.slots[i].path[0] = '\0';
+	}
+	app->home.bitmap = 0;
+	up_write(&app->home.rwsem);
+
+	// put the dentries outside the critical section
+	for (int i = 0; i < HOME_NR; i++) {
+		if (old[i]) {
+			dput(old[i]);
+		}
+	}
+}
+
+int resolve_dir(const char *pathstr, struct dentry **out)
+{
+	struct path p;
+	int err;
+
+	if (!pathstr || !out) {
+		pr_warn("[perapp]: (resolve_dir) called with NULL %s\n",
+			!pathstr ? "pathstr" : "out");
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+
+	err = kern_path(pathstr, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &p);
+	if (err)
+		return err;
+
+	// pin the dentry of the path
+	// if caller fails after resolving the path, they should dput() it
+	*out = dget(p.dentry);
+	path_put(&p);
+
+	if (!S_ISDIR(d_backing_inode(*out)->i_mode)) {
+		dput(*out);
+		*out = NULL;
+		return -ENOTDIR;
+	}
+
+	// returning a directory dentry
+	return 0;
+}
+
+int per_app_home_entry_set(struct per_app *app, enum home_type type,
+			   const char *pathstr)
+{
+	struct dentry *new_root = NULL, *old = NULL;
+	int err;
+
+	// check app not null, type valid, pathstr not null or empty
+	if (unlikely(!app || type >= HOME_NR || !pathstr || !*pathstr))
+		return -EINVAL;
+
+	// resolve path to dentry
+	err = resolve_dir(pathstr, &new_root);
+	if (unlikely(err)) {
+		pr_warn("[perapp]: (home_entry_set) failed to resolve path '%s'. code=%d\n",
+			pathstr, err);
+		return err;
+	}
+
+	// after this point, we must dput(new_root) on all error paths
+
+	down_write(&app->home.rwsem);
+
+	old = app->home.slots[type].root;
+
+	// the old ptr is the same as new ptr
+	// just refresh the path string (namespace shenanigans..?)
+	if (unlikely(old == new_root)) {
+		strscpy(app->home.slots[type].path, pathstr,
+			sizeof(app->home.slots[type].path));
+		up_write(&app->home.rwsem);
+
+		// drop new ref that we got in resolve_dir()
+		dput(new_root);
+		return 0;
+	}
+
+	// publish the new root
+	app->home.slots[type].root = new_root;
+	app->home.slots[type].type = type;
+	strscpy(app->home.slots[type].path, pathstr,
+		sizeof(app->home.slots[type].path));
+	app->home.bitmap |= HOME_BIT(type);
+
+	up_write(&app->home.rwsem);
+
+	// drop old root outside critical section (if any)
+	if (old)
+		dput(old);
+	return 0;
+}
+
+int per_app_home_entry_clear(struct per_app *app, enum home_type type)
+{
+	struct dentry *old;
+
+	if (unlikely(!app || type >= HOME_NR))
+		return -EINVAL;
+
+	down_write(&app->home.rwsem);
+	old = app->home.slots[type].root;
+	app->home.slots[type].root = NULL;
+	app->home.slots[type].path[0] = '\0';
+	app->home.bitmap &= ~HOME_BIT(type);
+	up_write(&app->home.rwsem);
+
+	if (old)
+		dput(old);
+	return 0;
+}
+
+#pragma endregion
+
+#pragma region inode_tagging
+
+static struct rhashtable inode_tag_ht;
+
+static const struct rhashtable_params inode_tag_rht_params = {
+	.head_offset = offsetof(struct inode_tag, hnode),
+	.key_offset = offsetof(struct inode_tag, inode),
+	.key_len = sizeof(struct inode *),
+	.automatic_shrinking = true,
+	.nelem_hint = 1024,
+};
+
+int inode_tag_ht_init(void)
+{
+	return rhashtable_init(&inode_tag_ht, &inode_tag_rht_params);
+}
+
+void inode_tag_ht_destroy(void)
+{
+	rhashtable_free_and_destroy(&inode_tag_ht, inode_tag_free_elem, NULL);
+}
+
+void inode_tag_free_rcu(struct rcu_head *rcu)
+{
+	struct inode_tag *t = container_of(rcu, struct inode_tag, rcu);
+	kfree(t);
+}
+
+// we need the arg for rhashtable_free_and_destroy but we dont use it
+void inode_tag_free_elem(void *ptr, void *arg)
+{
+	struct inode_tag *t = ptr;
+	kfree(t);
+}
+
+// 1 on success, 0 if not found, negative on error
+int per_app_home_match_dentry(struct per_app *app, struct dentry *leaf,
+			      enum home_type *out_type)
+{
+	u32 bm;
+	int hit = 0;
+
+	if (unlikely(!app || !leaf))
+		return -EINVAL;
+
+	down_read(&app->home.rwsem);
+	bm = app->home.bitmap;
+
+	for (int i = 0; i < HOME_NR; i++) {
+		struct dentry *root;
+
+		if (!(bm & HOME_BIT(i)))
+			continue;
+
+		root = app->home.slots[i].root;
+
+		// root invalid (should not happen)
+		if (unlikely(!root)) {
+			up_read(&app->home.rwsem);
+			pr_err("[perapp]: (home_match_dentry) invalid root dentry\n");
+			WARN_ON_ONCE(1);
+			return -EFAULT;
+		}
+
+		// check if leaf is under root
+		rcu_read_lock();
+		if (leaf->d_sb == root->d_sb && d_ancestor(leaf, root)) {
+			if (out_type) {
+				*out_type = app->home.slots[i].type;
+			}
+			hit = 1;
+		}
+		rcu_read_unlock();
+
+		if (hit)
+			break;
+	}
+
+	up_read(&app->home.rwsem);
+	return hit;
+}
+
+// dont use in production code, this is slow
+int per_app_home_match_inode(struct per_app *app, struct inode *inode,
+			     enum home_type *out_type)
+{
+	struct dentry *alias;
+	int ret;
+
+	if (unlikely(!app || !inode)) {
+		pr_warn("[perapp]: (home_match_inode) called with NULL %s\n",
+			!app ? "app" : "inode");
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+
+	alias = d_find_any_alias(inode);
+	if (!alias)
+		return 0;
+
+	ret = per_app_home_match_dentry(app, alias, out_type);
+	dput(alias);
+	return ret;
+}
+
+// will tag the inode if necessary
+// no-op if already tagged
+// no-op if not under any home
+// no-op if not a regular file
+// no-op if f is NULL
+void per_app_do_dentry_open_instrument(struct file *f)
+{
+	struct inode *inode;
+	struct inode_tag *tag;
+	struct per_app *app;
+	enum home_type htype;
+	struct inode_tag *new_tag;
+	struct inode_tag
+		*old_tag; // tag that is found if another thread inserted first
+
+	if (unlikely(!READ_ONCE(per_app_ready)))
+		return;
+
+	if (unlikely(!current->mm))
+		return;
+
+	if (unlikely(!f))
+		return;
+
+	inode = file_inode(f);
+	if (unlikely(!inode)) {
+		pr_warn("[perapp]: (per_app_do_dentry_open_instrument) called with NULL inode\n");
+		WARN_ON_ONCE(1);
+		return;
+	}
+
+	// skip non-regular files and O_PATH
+	if (unlikely(!S_ISREG(inode->i_mode) || (f->f_flags & O_PATH)))
+		return;
+
+	// check already tagged
+	tag = rhashtable_lookup_fast(&inode_tag_ht, &inode,
+				     inode_tag_rht_params);
+
+	// already tagged
+	if (tag)
+		return;
+
+	// get current app
+	app = per_app_get_current();
+	if (!app)
+		return;
+
+	// not under any home - nothing to tag
+	if (per_app_home_match_dentry(app, f->f_path.dentry, &htype) != 1) {
+		goto put;
+	}
+
+	// insert new tag into the hashtable (we might loose the race if another thread inserts first)
+
+	// this allocation is slow....? should we use atomic or slab cache?
+	new_tag = kzalloc(sizeof(*new_tag), GFP_KERNEL);
+
+	if (!new_tag) {
+		pr_warn("[perapp]: (per_app_open_instrument) memory allocation failed\n");
+		goto put;
+	}
+
+	new_tag->inode = inode;
+	new_tag->owner = app;
+	new_tag->type = htype;
+
+	old_tag = rhashtable_lookup_get_insert_fast(
+		&inode_tag_ht, &new_tag->hnode, inode_tag_rht_params);
+
+	// insertion error, drop the new tag
+	if (IS_ERR(old_tag)) {
+		pr_warn("[perapp]: (per_app_open_instrument) rhashtable insertion error\n");
+		goto put_and_free;
+	}
+	// race lost
+	if (old_tag) {
+		goto put_and_free;
+	}
+
+put:
+	// successful insertion
+#ifdef CONFIG_PAPP_USE_KREF
+	per_app_put(app);
+#endif
+	return;
+
+put_and_free:
+	// something died, new tag is not required
+#ifdef CONFIG_PAPP_USE_KREF
+	per_app_put(app);
+#endif
+	kfree(new_tag);
+	return;
+}
+
+// remove tag if inode was tagged
+void per_app_destroy_inode_instrument(struct inode *inode)
+{
+	struct inode_tag *t;
+
+	if (unlikely(!READ_ONCE(per_app_ready)))
+		return;
+
+	if (unlikely(!current->mm))
+		return;
+
+	if (unlikely(!inode)) {
+		pr_warn("[perapp]: (destroy_inode_instrument) called with NULL inode\n");
+		WARN_ON_ONCE(1);
+		return;
+	}
+
+	t = rhashtable_lookup_fast(&inode_tag_ht, &inode, inode_tag_rht_params);
+	if (!t)
+		return;
+
+	// try to remove, might race with another thread removing it
+	// rhashtable_remove_fast returns 0 on success
+	if (!rhashtable_remove_fast(&inode_tag_ht, &t->hnode,
+				    inode_tag_rht_params)) {
+		call_rcu(&t->rcu, inode_tag_free_rcu);
+	}
+}
+
+static inline unsigned int perapp_folio_pages(const struct folio *f)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	return folio_nr_pages((struct folio *)f);
+#else
+	return 1;
+#endif
+}
+
+// this is basically per_app_add_filepage
+// 0 for tagged, moved to perapp
+// 1 for not tagged, not managed by perapp
+// negative on error
+int per_app_filemap_add_folio_instrument(struct address_space *mapping,
+					 struct folio *folio)
+{
+	struct inode *inode = mapping ? mapping->host : NULL;
+	struct inode_tag *t;
+	struct per_app *app;
+	unsigned int nr;
+
+	if (unlikely(!READ_ONCE(per_app_ready)))
+		return 1;
+
+	if (unlikely(!current->mm))
+		return 1;
+
+	VM_BUG_ON_FOLIO(folio_test_active(folio) &&
+				folio_test_unevictable(folio),
+			folio);
+	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+
+	if (unlikely(!inode || !folio)) {
+		pr_warn("[perapp]: (filemap_add_folio_instrument) called with NULL %s\n",
+			!inode ? "inode" : "folio");
+		WARN_ON_ONCE(1);
+		return -EFAULT;
+	}
+
+	// is this inode tagged?
+	t = rhashtable_lookup_fast(&inode_tag_ht, &inode, inode_tag_rht_params);
+	if (!t)
+		return 1; // success, not tagged -> not managed by per_app
+
+	app = t->owner;
+
+	if (unlikely(!app)) {
+		pr_warn("[perapp]: (filemap_add_folio_instrument) found NULL app\n");
+		WARN_ON_ONCE(1);
+		return -EFAULT;
+	}
+
+	nr = perapp_folio_pages(folio);
+
+	// must not be on lru
+	if (WARN_ON_ONCE(folio_test_lru(folio))) {
+		pr_warn("[perapp]: (filemap_add_folio_instrument) folio is already on LRU\n");
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+
+	// register this folio to the app
+	if (TestSetPagePerApp(&folio->page)) {
+		// already managed by per_app, something is wrong if this happens we die
+		pr_warn("[perapp]: (filemap_add_folio_instrument) insertion attempt of a folio that is already managed by per_app\n");
+		WARN_ON_ONCE(1);
+		return -EEXIST;
+	}
+
+	folio_test_clear_active(folio);
+	folio_get(folio);
+
+	spin_lock(&app->filepage_list_lock);
+	list_add_tail(&folio->lru, &app->filepage_list);
+	spin_unlock(&app->filepage_list_lock);
+	atomic_long_add(nr, &app->nr_pages);
+	atomic_long_add(nr, &app->nr_file_pages);
+
+	folio_put(folio);
+
+	return 0; // success, tagged -> managed by per_app
+}
+
+//
+int per_app_filemap_remove_folio_instrument(struct address_space *mapping,
+					    struct folio *folio)
+{
+	struct inode *inode = mapping ? mapping->host : NULL;
+	struct inode_tag *t;
+	struct per_app *app;
+	unsigned int nr;
+
+	if (unlikely(!READ_ONCE(per_app_ready)))
+		return 1;
+
+	if (unlikely(!current->mm))
+		return 1;
+
+	if (unlikely(!inode || !folio)) {
+		pr_warn("[perapp]: (filemap_remove_folio_instrument) per_app_filemap_remove_folio_instrument called with NULL %s\n",
+			!inode ? "inode" : "folio");
+		WARN_ON_ONCE(1);
+		return -EFAULT;
+	}
+
+	t = rhashtable_lookup_fast(&inode_tag_ht, &inode, inode_tag_rht_params);
+	if (!t)
+		return 1; // success, not tagged -> not managed by per_app
+
+	app = t->owner;
+	if (unlikely(!app)) {
+		pr_warn("[perapp]: (filemap_remove_folio_instrument) per_app_filemap_remove_folio_instrument found NULL app\n");
+		WARN_ON_ONCE(1);
+		return -EFAULT;
+	}
+
+	nr = perapp_folio_pages(folio);
+
+	if (WARN_ON_ONCE(folio_test_lru(folio))) {
+		pr_warn("[perapp]: (filemap_remove_folio_instrument) folio is already on LRU\n");
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+
+	if (!TestClearPagePerApp(&folio->page)) {
+		// not managed by per_app, something is wrong if this happens we die
+		pr_warn("[perapp]: (filemap_remove_folio_instrument) removal attempt of a folio that is not managed by per_app\n");
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+
+	folio_get(folio);
+
+	spin_lock(&app->filepage_list_lock);
+	list_del(&folio->lru);
+	spin_unlock(&app->filepage_list_lock);
+	atomic_long_sub(nr, &app->nr_pages);
+	atomic_long_sub(nr, &app->nr_file_pages);
+
+	folio_put(folio);
+
+	return 0;
+}
+
+#pragma endregion
 
 /*
  * cleanup per-app subsystem
@@ -1148,7 +1683,9 @@ int __init per_app_init_subsystem(void)
 void __exit per_app_exit_subsystem(void)
 {
 	pr_info("[perapp] system exiting\n");
+	smp_store_release(&per_app_ready, false);
 	per_app_manager_exit();
+	inode_tag_ht_destroy();
 }
 
 /* initialize per-app system after core memory management */

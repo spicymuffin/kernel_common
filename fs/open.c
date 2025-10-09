@@ -34,6 +34,10 @@
 #include <linux/compat.h>
 #include <linux/mnt_idmapping.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 #include "internal.h"
 #include <trace/hooks/syscall_check.h>
 
@@ -840,6 +844,11 @@ static int do_dentry_open(struct file *f,
 	if (unlikely(f->f_flags & O_PATH)) {
 		f->f_mode = FMODE_PATH | FMODE_OPENED;
 		f->f_op = &empty_fops;
+
+		// O_PATH - only allow access to the path itself, not the target
+		// so no entries in the page cache (?)
+		// so we wont instrument here, theres nothing to reclaim here (i think)
+
 		return 0;
 	}
 
@@ -932,6 +941,10 @@ static int do_dentry_open(struct file *f,
 			filemap_invalidate_unlock(inode->i_mapping);
 		}
 	}
+
+#ifdef CONFIG_PAPP
+	per_app_do_dentry_open_instrument(f);
+#endif
 
 	return 0;
 
