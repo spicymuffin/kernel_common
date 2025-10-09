@@ -526,7 +526,7 @@ int commit_creds(struct cred *new)
 			from_kuid(&init_user_ns, new->uid),
 			from_kuid(&init_user_ns, new->euid));
 
-		/* If no per_app struct exists for the new UID, create one */
+		/* If no per_app struct exists for the new PID, create one */
 		app = per_app_find(task_tgid_nr(task));
 		if (!app) {
 			pr_info("[per-app-debug] commit_creds: Creating per_app struct for PID %d with UID %d\n",

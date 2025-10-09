@@ -129,9 +129,9 @@ struct per_app {
 	// atomic_t nr_processes; // should be just 1. if 0, main thread exited
 	atomic_t nr_tasks; // including main thread
 
+	char package_name[PACKAGE_NAME_LEN]; // com.app.android
+
 	// these fields are not currently being used.. but maybe in the future
-	// char package_name[32]; // com.app.android
-	// char package_name[256]; // com.app.android
 	// int oom_score_adj;
 	// unsigned long flags; // reclaim flags for this per-app
 
