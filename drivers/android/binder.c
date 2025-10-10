@@ -78,6 +78,10 @@
 #include "binder_trace.h"
 #include <trace/hooks/binder.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
 
@@ -6267,6 +6271,10 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	struct dentry *binder_binderfs_dir_entry_proc = NULL;
 	bool existing_pid = false;
 
+	#ifdef CONFIG_PAPP
+	struct per_app *app;
+	#endif
+
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE, "%s: %d:%d\n", __func__,
 		     current->group_leader->pid, current->pid);
 
@@ -6360,6 +6368,14 @@ static int binder_open(struct inode *nodp, struct file *filp)
 				strbuf, error);
 		}
 	}
+
+	#ifdef CONFIG_PAPP
+	app = per_app_get_current();
+	if (app) {
+		get_cmdline(current, app->cmdline, sizeof(app->cmdline));
+		parse_cmdline(app);
+	}
+	#endif
 
 	return 0;
 }

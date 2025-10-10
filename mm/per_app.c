@@ -62,103 +62,6 @@ const uid_t target_app_uids[] = {
 };
 */
 
-#ifdef ZYGOTE_INSTRUMENT_BYPASS
-
-#define ZIB_HASH_BITS 8
-
-const char default_home_paths[][HOME_NR][PATHSTR_LEN] = {
-	{ "/data/data/com.android.contacts", "" },
-	{ "/data/data/com.android.camera2", "" },
-	{ "/data/data/com.android.deskclock", "" },
-	{ "/data/data/com.android.calendar", "" },
-	{ "/data/data/com.android.gallery3d", "" },
-	{ "/data/data/com.android.messaging", "" },
-};
-
-const char default_package_names[][PACKAGE_NAME_LEN] = {
-	"com.android.contacts",	 "com.android.gallery3d",
-	"com.android.deskclock", "com.android.calendar",
-	"com.android.camera2",	 "com.android.messaging",
-};
-
-struct zib_entry {
-	u32 key; // uid
-	char pathstr[HOME_NR][PATHSTR_LEN]; // home dirs
-	char package_name[PACKAGE_NAME_LEN]; // package name
-	struct hlist_node hash_node;
-};
-
-DEFINE_HASHTABLE(g_ht, ZIB_HASH_BITS);
-
-static struct zib_entry *zib_ht_lookup(u32 key)
-{
-	struct zib_entry *it;
-	hash_for_each_possible(g_ht, it, hash_node, key) {
-		if (it->key == key)
-			return it;
-	}
-	return NULL;
-}
-
-static int zib_ht_add(int key, const char pathstr[HOME_NR][PATHSTR_LEN],
-		      const char *package_name)
-{
-	struct zib_entry *it = zib_ht_lookup(key);
-	if (it) {
-		for (int i = 0; i < HOME_NR; i++) {
-			if (pathstr[i]) {
-				strscpy(it->pathstr[i], pathstr[i],
-					sizeof(it->pathstr[i]));
-			}
-		}
-		strscpy(it->package_name, package_name,
-			sizeof(it->package_name));
-		return 0;
-	}
-
-	it = kmalloc(sizeof(*it), GFP_KERNEL);
-	if (!it)
-		return -ENOMEM;
-
-	it->key = key;
-	for (int i = 0; i < HOME_NR; i++) {
-		if (pathstr[i]) {
-			strscpy(it->pathstr[i], pathstr[i],
-				sizeof(it->pathstr[i]));
-		}
-	}
-
-	strscpy(it->package_name, package_name, sizeof(it->package_name));
-	hash_add(g_ht, &it->hash_node, it->key);
-	return 0;
-}
-
-static int zib_ht_init(void)
-{
-	hash_init(g_ht);
-
-	for (int i = 0;
-	     i < sizeof(target_app_uids) / sizeof(target_app_uids[0]); i++) {
-		zib_ht_add(target_app_uids[i], default_home_paths[i],
-			   default_package_names[i]);
-	}
-	return 0;
-}
-
-static void zib_ht_destroy(void)
-{
-	struct zib_entry *it;
-	struct hlist_node *tmp;
-	int bkt;
-
-	hash_for_each_safe(g_ht, bkt, tmp, it, hash_node) {
-		hash_del(&it->hash_node);
-		kfree(it);
-	}
-}
-
-#endif
-
 const size_t num_target_app_uids = ARRAY_SIZE(target_app_uids);
 
 /* global per-app manager */
@@ -989,10 +892,6 @@ void per_app_process_fork(struct task_struct *parent, struct task_struct *child)
 	pid_t child_pid;
 	pid_t child_tid;
 
-#ifdef ZYGOTE_INSTRUMENT_BYPASS
-	struct zib_entry *zib;
-#endif
-
 	/* skip kernel threads */
 	if (!child->mm)
 		return;
@@ -1027,28 +926,6 @@ void per_app_process_fork(struct task_struct *parent, struct task_struct *child)
 				}
 			}
 
-#ifdef ZYGOTE_INSTRUMENT_BYPASS
-			pr_info("[per_app_process_fork]: doing zygote bypass for uid=%u pid=%u (%s)\n",
-				from_kuid(&init_user_ns, child_uid), child_pid,
-				app->app_name);
-			zib = zib_ht_lookup(
-				from_kuid(&init_user_ns, child_uid));
-			if (zib) {
-				per_app_home_entry_set(app, HOME_CE,
-						       zib->pathstr[HOME_CE]);
-				pr_info("[per_app_process_fork]: setting HOME_CE to %s\n",
-					zib->pathstr[HOME_CE]);
-				per_app_home_entry_set(app, HOME_DE,
-						       zib->pathstr[HOME_DE]);
-				pr_info("[per_app_process_fork]: setting HOME_DE to %s\n",
-					zib->pathstr[HOME_DE]);
-				strscpy(app->package_name, zib->package_name,
-					PACKAGE_NAME_LEN);
-			} else {
-				pr_warn("[per_app_process_fork]: no zib entry found for uid %u\n",
-					from_kuid(&init_user_ns, child_uid));
-			}
-#endif
 #ifdef CONFIG_PAPP_USE_KREF
 			per_app_put(app);
 #endif
@@ -1277,16 +1154,6 @@ int __init per_app_init_subsystem(void)
 		       ret);
 		return ret;
 	}
-
-#ifdef ZYGOTE_INSTRUMENT_BYPASS
-
-	ret = zib_ht_init();
-	if (ret) {
-		pr_err("[perapp]: Failed to initialize zib ht: %d\n", ret);
-		return ret;
-	}
-
-#endif
 
 #ifdef CONFIG_PROC_FS
 	ret = per_app_create_proc_entry();
@@ -1820,6 +1687,12 @@ int per_app_filemap_remove_folio_instrument(struct address_space *mapping,
 
 #pragma endregion
 
+int parse_cmdline(struct per_app *app)
+{
+	pr_info("[parse_cmdline]: cmdline='%s'\n", app->cmdline);
+	return 0;
+}
+
 /*
  * cleanup per-app subsystem
  */
@@ -1827,7 +1700,6 @@ void __exit per_app_exit_subsystem(void)
 {
 	pr_info("[perapp] system exiting\n");
 	smp_store_release(&per_app_ready, false);
-	zib_ht_destroy();
 	per_app_manager_exit();
 	inode_tag_ht_destroy();
 }

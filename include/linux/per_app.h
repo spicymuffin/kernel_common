@@ -3,7 +3,7 @@
 
 #include <linux/types.h>
 #include <linux/list.h>
-#include <linux/mm_types.h>
+// #include <linux/mm_types.h>
 #include <linux/spinlock.h>
 #include <linux/atomic.h>
 #include <linux/uidgid.h>
@@ -37,6 +37,7 @@ extern const size_t num_target_app_uids;
 
 #define PATHSTR_LEN 256
 #define PACKAGE_NAME_LEN 256
+#define CMDLINE_LEN 1024 // i have no idea how long this can be
 
 #define TEMP_HOME_PATHSTR "/var/tmp" // tmp pathstr for apps without home dir
 
@@ -130,6 +131,7 @@ struct per_app {
 	atomic_t nr_tasks; // including main thread
 
 	char package_name[PACKAGE_NAME_LEN]; // com.app.android
+	char cmdline[CMDLINE_LEN]; // full command line
 
 	// these fields are not currently being used.. but maybe in the future
 	// int oom_score_adj;
@@ -300,6 +302,9 @@ extern void setup_scan_control_advanced(enum per_app_reclaim_type type,
 					unsigned long nr_to_reclaim,
 					bool aggressive,
 					struct mem_cgroup *memcg);
+
+// parse cmdline and extract package name, home directories, etc
+int parse_cmdline(struct per_app *app);
 
 // home_dentry_cache management
 void per_app_home_dentry_cache_init(struct per_app *app);
