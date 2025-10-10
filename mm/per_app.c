@@ -44,7 +44,12 @@ const size_t num_target_app_uids = ARRAY_SIZE(target_app_uids);
 // static package names
 const char *packages[] = {
   "com.instagram.android",
-  "com.google.android.deskclock"
+  "com.android.deskclock",
+  "com.android.music",
+  "com.android.calendar",
+  "com.android.camera2",
+  "com.android.messaging",
+  "com.android.contacts"
 };
 int num_packages = sizeof(packages) / sizeof(packages[0]);
 
@@ -210,7 +215,7 @@ int per_app_match_home_dentry(struct per_app *app, struct dentry *dentry, struct
     return 1;
   }
   
-  if (dentry->d_sb == home_dentry->d_sb && d_ancestor(dentry, home_dentry)) {
+  if (dentry->d_sb == home_dentry->d_sb && d_ancestor(home_dentry, dentry)) {
     // match found, tag inode
     inode_set_flags(inode, S_PERAPP, S_PERAPP);
     return 0;
@@ -261,6 +266,7 @@ void per_app_instrument_destroy_inode(struct inode *inode)
   if (IS_PERAPP(inode)) {
     inode_set_flags(inode, 0, S_PERAPP);
   }
+  // TODO: cleanup file pages from page list?
 }
 
 // 0 : success
@@ -279,33 +285,12 @@ int per_app_instrument_filemap_add_folio(struct address_space *mapping, struct f
   }
   
   app = per_app_get_current();
-  if (!app) {
-    return 1;
-    if (IS_PERAPP(inode)) {
-      // add this page to per-app file page list
-      if (TestSetPagePerApp(page)) {
-        return -EEXIST;
-      }
-      if (TestClearPageLRU(page)) {
-        pr_warn("[filemap_add_folio] page is in lru\n");
-        WARN_ON_ONCE(1);
-      }
-      TestClearPageActive(page);
-      get_page(page);
 
-      spin_lock(&app->file_page_list_lock);
-      list_add_tail(&page->lru, &app->file_page_list);
-      atomic_long_inc(&app->nr_pages);
-      atomic_long_inc(&app->nr_file_pages);
-      spin_unlock(&app->file_page_list_lock);
-
-      put_page(page);
-
-      return 0;
-    } else {
-      return 1;
-    }
+  if (app && IS_PERAPP(inode)) {
+    // add this file page
+    return per_app_add_file_page(page, app);
   }
+
   return 1;
 }
 
@@ -574,6 +559,38 @@ void per_app_restore_anon_rmap(struct page *page, struct vm_area_struct *vma)
   }
 }
 
+
+// return 0 on success
+int per_app_add_file_page(struct page *page, struct per_app *app) {
+
+  VM_BUG_ON_PAGE(PageActive(page) && PageUnevictable(page), page);
+  VM_BUG_ON_PAGE(PageLRU(page), page);
+  
+  if (!app ||!page)
+    return -EINVAL;
+
+  // if page is already being managed by per_app, skip or error
+  if (TestSetPagePerApp(page))
+    return -EEXIST;
+
+  // the page may have been managed by LRU before (shared -> per_app case)
+  // in that case, remove the lru link and add to page list.
+  if (WARN_ON_ONCE(TestClearPageLRU(page))) {
+    pr_warn("[per_app_add_file_page]: this per-app page was managed by lru.\n");
+    //list_del_init(&page->lru);
+  }
+  
+  TestClearPageActive(page);
+  get_page(page);
+  spin_lock(&app->file_page_list_lock);
+  list_add_tail(&page->lru, &app->file_page_list);
+  atomic_long_inc(&app->nr_pages);
+  atomic_long_inc(&app->nr_file_pages);
+  spin_unlock(&app->file_page_list_lock);
+  put_page(page);
+
+  return 0;
+}
 
 /*
  * add page to application's page list

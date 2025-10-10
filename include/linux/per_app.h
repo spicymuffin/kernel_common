@@ -224,6 +224,7 @@ struct per_app *per_app_get(struct per_app *app);
 void per_app_put(struct per_app *app);
 #endif
 
+int per_app_add_file_page(struct page *page, struct per_app *app);
 int per_app_add_page(struct page *page, struct per_app *app);
 int per_app_add_page_vma(struct page *page, struct vm_area_struct *vma, struct per_app *app);
 void per_app_remove_file_page(struct per_app *app, struct page *page);
