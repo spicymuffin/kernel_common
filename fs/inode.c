@@ -26,6 +26,10 @@
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/vmscan.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 /*
  * Inode locking rules:
  *
@@ -309,6 +313,11 @@ static void destroy_inode(struct inode *inode)
 	const struct super_operations *ops = inode->i_sb->s_op;
 
 	BUG_ON(!list_empty(&inode->i_lru));
+
+#ifdef CONFIG_PAPP
+  per_app_instrument_destroy_inode(inode);
+#endif
+
 	__destroy_inode(inode);
 	if (ops->destroy_inode) {
 		ops->destroy_inode(inode);

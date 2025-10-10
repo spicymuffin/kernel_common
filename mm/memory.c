@@ -975,9 +975,22 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	unsigned long vm_flags = src_vma->vm_flags;
 	pte_t pte = *src_pte;
 	struct page *page;
+#ifdef CONFIG_PAPP
+  struct per_app *app;
+#endif
 
 	page = vm_normal_page(src_vma, addr, pte);
 	if (page && PageAnon(page)) {
+#ifdef CONFIG_PAPP
+    if (PagePerApp(page)) {
+      app = per_app_get_current();
+      if (app) {
+        per_app_move_page_to_lru(app, page, src_vma);
+      } else {
+        WARN(1, "[copy_present_pte]: anon page is per_app, but no per_app struct exists\n");
+      }    
+    }    
+#endif
 		/*
 		 * If this page may have been pinned by the parent process,
 		 * copy the page immediately for the child so that we'll always
@@ -993,6 +1006,16 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 		}
 		rss[mm_counter(page)]++;
 	} else if (page) {
+#ifdef CONFIG_PAPP
+    if (PagePerApp(page)) {
+      app = per_app_get_current();
+      if (app) {
+        per_app_move_page_to_lru(app, page, src_vma);
+      } else {
+        WARN(1, "[copy_present_pte]: file page is per_app, but no per_app struct exists\n");
+      }
+    }
+#endif
 		get_page(page);
 		page_dup_file_rmap(page, false);
 		rss[mm_counter(page)]++;
@@ -2917,8 +2940,8 @@ static inline int __wp_page_copy_user(struct page *dst, struct page *src,
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long addr = vmf->address;
-
-	if (likely(src)) {
+	
+  if (likely(src)) {
 		if (copy_mc_user_highpage(dst, src, addr, vma)) {
 			memory_failure_queue(page_to_pfn(src), 0);
 			return -EHWPOISON;
@@ -3197,7 +3220,9 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	int page_copied = 0;
 	struct mmu_notifier_range range;
 	vm_fault_t ret;
-
+#ifdef CONFIG_PAPP
+  struct per_app *app;
+#endif
 	delayacct_wpcopy_start();
 
 	ret = vmf_anon_prepare(vmf);
@@ -3281,7 +3306,17 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		 */
 		ptep_clear_flush_notify(vma, vmf->address, vmf->pte);
 		page_add_new_anon_rmap(new_page, vma, vmf->address);
+#ifdef CONFIG_PAPP
+    app = per_app_get_current();
+    if (app) {
+      per_app_add_page_vma(new_page, vma, app);
+      goto wp_page_copy_set_pte;
+    }
+#endif
 		lru_cache_add_inactive_or_unevictable(new_page, vma);
+#ifdef CONFIG_PAPP
+wp_page_copy_set_pte:
+#endif
 		/*
 		 * We call the notify macro here because, when using secondary
 		 * mmu page tables (such as kvm shadow page tables), we want the

@@ -53,6 +53,10 @@
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/mm.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 /*
  * FIXME: remove all knowledge of the buffer layer from the core VM
  */
@@ -978,6 +982,9 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 {
 	void *shadow = NULL;
 	int ret;
+#ifdef CONFIG_PAPP
+  int r;
+#endif
 
 	__folio_set_locked(folio);
 	ret = __filemap_add_folio(mapping, folio, index, gfp, &shadow);
@@ -995,8 +1002,23 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 		WARN_ON_ONCE(folio_test_active(folio));
 		if (!(gfp & __GFP_WRITE) && shadow)
 			workingset_refault(folio, shadow);
+#ifdef CONFIG_PAPP
+    // 0 : moved to perapp
+    // 1 : global LRU
+    // <0: error
+    r = per_app_instrument_filemap_add_folio(mapping, folio);
+    if (r == 0) {
+      goto filemap_add_folio_skip_lru;
+    } else if (r < 0) {
+      WARN(1, "[filemap_add_folio] ERROR: cannot add page to per-app\n");
+    }
+
+#endif
 		folio_add_lru(folio);
 	}
+#ifdef CONFIG_PAPP
+filemap_add_folio_skip_lru:
+#endif
 	return ret;
 }
 EXPORT_SYMBOL_GPL(filemap_add_folio);

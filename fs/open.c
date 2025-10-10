@@ -37,6 +37,10 @@
 #include "internal.h"
 #include <trace/hooks/syscall_check.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif
+
 int do_truncate(struct user_namespace *mnt_userns, struct dentry *dentry,
 		loff_t length, unsigned int time_attrs, struct file *filp)
 {
@@ -932,7 +936,9 @@ static int do_dentry_open(struct file *f,
 			filemap_invalidate_unlock(inode->i_mapping);
 		}
 	}
-
+#ifdef CONFIG_PAPP
+  per_app_instrument_do_dentry_open(f);
+#endif
 	return 0;
 
 cleanup_all:

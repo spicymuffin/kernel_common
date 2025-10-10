@@ -1041,11 +1041,14 @@ void release_pages(struct page **pages, int nr)
 				if (!folio_test_clear_per_app(folio)) {
 					goto check_lru;
 				}
-
-				per_app_remove_page(app, folio_page(folio, 0));
+        if (folio_test_anon(folio)) {
+				  per_app_remove_page(app, folio_page(folio, 0));
+        } else {
+          per_app_remove_file_page(app, folio_page(folio, 0));
+        }
 				//folio_clear_per_app(folio);
 				if (folio_test_lru(folio))
-					pr_warn("[perapp] THIS PAGE IS BOTH IN PER-APP AND LRU\n");
+					pr_warn("[release_pages] THIS PAGE IS BOTH IN PER-APP AND LRU\n");
 #ifdef CONFIG_PAPP_USE_KREF
 				per_app_put(app);
 #endif

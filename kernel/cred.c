@@ -516,38 +516,35 @@ int commit_creds(struct cred *new)
 	alter_cred_subscribers(old, -2);
 
 #ifdef CONFIG_PAPP
-	/* Debug: Print UID changes for per-app debugging */
-	if (!uid_eq(old->uid, new->uid) &&
-	    per_app_is_target_uid(from_kuid(&init_user_ns, new->uid))) {
-		pr_info("[per-app-debug] commit_creds: PID %d (%s) UID change: old_uid=%d old_euid=%d -> new_uid=%d new_euid=%d\n",
-			task_tgid_nr(task), task->comm,
-			from_kuid(&init_user_ns, old->uid),
-			from_kuid(&init_user_ns, old->euid),
-			from_kuid(&init_user_ns, new->uid),
-			from_kuid(&init_user_ns, new->euid));
-
-		/* If no per_app struct exists for the new UID, create one */
-		app = per_app_find(task_tgid_nr(task));
-		if (!app) {
-			pr_info("[per-app-debug] commit_creds: Creating per_app struct for PID %d with UID %d\n",
-				task_tgid_nr(task),
-				from_kuid(&init_user_ns, new->uid));
-			app = per_app_create(task);
-			if (!app) {
-				WARN(1, "CANNOT ALLOC MEMORY FOR PER_APP\n");
-				BUG();
-			}
-		} else {
-			/* Update per-app cache after credentials are committed */
-			// pr_info("[per-app-debug] commit_creds: Updating per-app cache for PID %d after UID change\n",
-			// 	task_tgid_nr(task));
-			// per_app_update_cached(task);
-			WARN(1,
-			     "per-app-debug] ERROR: per_app struct already exists for PID %d with UID %d\n",
-			     task_tgid_nr(task),
-			     from_kuid(&init_user_ns, new->uid));
-		}
-	}
+  /* Debug: Print UID changes for per-app debugging */
+  if (!uid_eq(old->uid, new->uid) && per_app_is_target_uid(from_kuid(&init_user_ns, new->uid))) {
+#ifdef CONFIG_DEBUG_PAPP
+    pr_info("[per-app-debug] commit_creds: PID %d (%s) UID change: old_uid=%d old_euid=%d -> new_uid=%d new_euid=%d\n",
+      task_tgid_nr(task), task->comm,
+      from_kuid(&init_user_ns, old->uid),
+      from_kuid(&init_user_ns, old->euid),
+      from_kuid(&init_user_ns, new->uid),
+      from_kuid(&init_user_ns, new->euid));
+#endif
+    /* If no per_app struct exists for the new UID, create one */
+    app = per_app_find(task_tgid_nr(task));
+    if (likely(!app)) {
+#ifdef CONFIG_DEBUG_PAPP
+      pr_info("[per-app-debug] commit_creds: Creating per_app struct for PID %d with UID %d\n",
+        task_tgid_nr(task), from_kuid(&init_user_ns, new->uid));
+#endif
+      app = per_app_create(task);
+      if (!app) {
+        WARN(1, "CANNOT ALLOC MEMORY FOR PER_APP\n");
+        BUG();
+      }   
+    } else {
+      /* Update per-app cache after credentials are committed */
+      WARN(1, "per-app-debug] ERROR: per_app struct already exists for PID %d with UID %d\n",
+        task_tgid_nr(task), from_kuid(&init_user_ns, new->uid));
+      BUG();
+    }   
+  }
 #endif
 
 	/* send notifications */
