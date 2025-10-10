@@ -36,6 +36,18 @@ config PAPP_USE_KREF
   help
     If enabled, use kref to manage per_app struct refcount
 
+config PAPP_BASELINE_RECLAIM_POLICY
+  bool "use baseline memory reclaim"
+  default n
+  help
+    baseline memory reclaim logic
+
+config PAPP_USE_2Q
+  bool "use 2q instead of LRU"
+  default n
+  help
+    2-queue
+
 menuconfig SWAP
 	bool "Support for paging of anonymous memory (swap)"
 	depends on MMU && BLOCK && !ARCH_NO_SWAP
