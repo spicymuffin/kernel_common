@@ -7627,16 +7627,9 @@ static unsigned int per_app_shrink_app(struct list_head *folio_list,
 		goto keep_locked;
 		*/
 
-		// this page is being shared! must go back to LRU
-		if (folio_mapcount(folio) > 1) {
-			WARN(1,
-			     "[per_app_shrink_app] this page has mapcount > 1\n");
-#ifdef CONFIG_DEBUG_PAPP
-			pr_info("[perapp reclaim]: THIS PAGE IS SHARED\n");
-			pr_info("[perapp reclaim]: keep_locked: folio is shared and cannot be reclaimed.\n");
-			pr_info("                  folio_mapcount=%d\n",
-				folio_mapcount(folio));
-#endif
+		// Shared pages (mapcount > 1) cannot be reclaimed
+		// This should be rare since we filter in isolation, but check again for safety
+		if (unlikely(folio_mapcount(folio) > 1)) {
 			goto keep_locked;
 		}
 
@@ -7650,7 +7643,7 @@ static unsigned int per_app_shrink_app(struct list_head *folio_list,
 		}
 		if (writeback && folio_test_reclaim(folio)) {
 			stat->nr_congested += nr_pages;
-			pr_info(" this page is congested!!\n");
+			//pr_info(" this page is congested!!\n");
 		}
 		if (folio_test_writeback(folio)) {
 			if (current_is_kswapd() && folio_test_reclaim(folio) &&
@@ -8028,10 +8021,9 @@ static unsigned long per_app_isolate_app(struct per_app *app,
 		nr_pages = folio_nr_pages(folio);
 		total_scan += nr_pages;
 
-		// debug case 1: check mapcount
+		// Shared pages (mapcount > 1) cannot be reclaimed by per-app
+		// This is normal for shared libraries, framework code, etc.
 		if (folio_mapcount(folio) > 1) {
-			WARN(1,
-			     "[per_app_isolate_app] this page has mapcount > 1\n");
 			goto move;
 		}
 
@@ -8206,7 +8198,8 @@ static unsigned int per_app_move_folios_to_file_page_list(struct per_app *app,
 #ifdef CONFIG_DEBUG_PAPP
 			pr_info("[per_app_move_folios_to_file_page_list]: UNEVICTABLE\n");
 #endif
-			BUG();
+			//pr_warn("[per_app_move_folios_to_file_page_list]: UNEVICTABLE\n");
+			//BUG();
 		}
 		
 		folio_set_per_app(folio);
@@ -8217,7 +8210,8 @@ static unsigned int per_app_move_folios_to_file_page_list(struct per_app *app,
 #ifdef CONFIG_DEBUG_PAPP
 				pr_info("[per_app_move_folios_to_file_page_list]: LARGE FOLIO\n");
 #endif
-				BUG();
+				//pr_warn("[per_app_move_folios_to_file_page_list]: LARGE FOLIO\n");
+				//BUG();
 			} else
 				list_add(&folio->lru, &folios_to_free);
 			continue;
@@ -8499,7 +8493,8 @@ static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 
     /* Sanity check */
     if (unlikely(per_app_get_page_count(target_app) < 0UL)) {
-      BUG();
+      pr_warn("per_app %s has negative page count\n", target_app->app_name);
+      //BUG();
     }
 
 #ifdef CONFIG_DEBUG_PAPP

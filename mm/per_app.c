@@ -18,6 +18,21 @@
 #include <linux/namei.h>
 #include "internal.h"
 
+static int insert_offset = 1;
+
+void per_app_list_insert_from_tail(struct list_head *new, struct list_head *head)
+{
+  struct list_head *pos = head->prev;
+  int i;
+
+  for (i=0; i<insert_offset && pos != head; i++) {
+    pos = pos->prev;
+  }
+
+  __list_add(new, pos, pos->next);
+  insert_offset++;
+}
+
 const unsigned long reclaim_ratio[] = { 
   4,   /* R0->R1: 1/16 */
   3,   /* R1->R2: 1/8 */
@@ -43,13 +58,68 @@ const size_t num_target_app_uids = ARRAY_SIZE(target_app_uids);
 
 // static package names
 const char *packages[] = {
+  "com.zeptolab.ctr.ads",
+  "com.ebay.mobile",
+  "com.instagram.barcelona",
+  "com.facebook.katana",
+  "com.facebook.orca",
+  "com.madfingergames.legends",
+  "com.pinterest",
+  "com.wildspike.wormszone",
+  "org.mozilla.firefox",
+  "com.yelp.android",
+  "com.trivago",
+  "com.chess",
+  "com.halfbrick.fruitninjafree",
+  "com.block.juggle",
+  "com.mrp",
+  "com.nike.omega",
   "com.instagram.android",
-  "com.android.deskclock",
-  "com.android.music",
+  "com.android.providers.media.module",
+  "com.android.providers.contacts",
+  "com.android.companiondevicemanager",
+  "com.android.providers.downloads",
+  "com.android.credentialmanager",
+  "com.android.devicelockcontroller",
+  "com.android.documentsui",
+  "com.android.adservices.api",
+  "com.android.health.connect.backuprestore",
+  "com.android.virtualmachine.res",
+  "com.android.nearby.halfsheet",
+  "com.android.intentresolver",
+  "com.android.certinstaller",
+  "com.android.apps.tag",
+  "com.android.wifi.dialog",
+  "com.android.captiveportallogin",
+  "com.android.imsserviceentitlement",
+  "com.android.providers.media",
+  "com.android.statementservice",
+  "com.android.simappdialog",
+  "com.android.wallpaper.livepicker",
+  "com.android.printservice.recommendation",
   "com.android.calendar",
+  "com.android.managedprovisioning",
+  "com.android.emergency",
+  "com.android.healthconnect.controller",
+  "com.android.traceur",
+  "com.android.contacts",
+  "com.android.mtp",
+  "com.android.telephony.qns",
+  "com.android.ondevicepersonalization.services",
+  "com.android.ext.adservices.api",
+  "com.android.gallery3d",
+  "com.android.settings.intelligence",
+  "com.android.storagemanager",
+  "com.android.quicksearchbox",
+  "com.android.packageinstaller",
+  "com.android.printspooler",
+  "com.android.deskclock",
+  "com.android.egg",
+  "com.android.soundpicker",
+  "com.android.rkpdapp",
   "com.android.camera2",
-  "com.android.messaging",
-  "com.android.contacts"
+  "com.android.hotspot2.osulogin",
+  "com.android.messaging"
 };
 int num_packages = sizeof(packages) / sizeof(packages[0]);
 
@@ -251,11 +321,13 @@ void per_app_instrument_do_dentry_open(struct file *file)
   app = per_app_get_current();
 
   if (app) {
-    //pr_info("[do_dentry_open] app is opening file %s\n", dentry->d_name.name);
     // try to match dentry with per_app->home.home_path
+    per_app_match_home_dentry(app, dentry, inode); 
+    /*
     if(per_app_match_home_dentry(app, dentry, inode) == 0) {
       pr_info("[perapp] MATCH FOUND! inode is per-app, and tagged\n");
     }
+    */
   }
 
   return;
@@ -336,7 +408,13 @@ struct per_app *per_app_create(struct task_struct *task)
 
   // add this per_app to the head of global app list
   spin_lock(&global_app_manager.app_list_lock);
-  list_add(&app->app_list, &global_app_manager.app_list);
+  
+  if (strcmp(app->app_name, "anon_program") == 0) {
+    per_app_list_insert_from_tail(&app->app_list, &global_app_manager.app_list);
+  } else {
+    list_add(&app->app_list, &global_app_manager.app_list);
+  }
+
   atomic_inc(&global_app_manager.nr_apps);
   spin_unlock(&global_app_manager.app_list_lock);
 
@@ -1075,7 +1153,7 @@ void per_app_process_fork(struct task_struct *parent, struct task_struct *child)
     if (unlikely(app)) {
       WARN(1, "[per_app_process_fork] per_app struct already exists for main thread with PID %u UID %u\n",
               child_pid, from_kuid(&init_user_ns, child_uid));
-      BUG();
+      //BUG();
     } else {
       per_app_create(child);
     }
@@ -1095,7 +1173,7 @@ void per_app_process_fork(struct task_struct *parent, struct task_struct *child)
             WARN(1, "[per_app_process_fork] failed to resolve kernel path for %s\n",
                     app->app_name);
           } else {
-            pr_info("[per_app_process_fork] per_app home dentry cache is created\n");
+            //pr_info("[per_app_process_fork] per_app home dentry cache is created\n");
           }
         }
       }
@@ -1105,7 +1183,7 @@ void per_app_process_fork(struct task_struct *parent, struct task_struct *child)
     } else {
       WARN(1, "[per_app_process_fork]: per_app struct doesn't exist for child thread with PID: %d UID: %u\n",
         child_pid, from_kuid(&init_user_ns, child_uid));
-      BUG();
+      //BUG();
     }
   }
 

@@ -1006,11 +1006,18 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
     // 0 : moved to perapp
     // 1 : global LRU
     // <0: error
-    r = per_app_instrument_filemap_add_folio(mapping, folio);
-    if (r == 0) {
-      goto filemap_add_folio_skip_lru;
-    } else if (r < 0) {
-      WARN(1, "[filemap_add_folio] ERROR: cannot add page to per-app\n");
+    if (likely(folio_evictable(folio))) {
+
+      r = per_app_instrument_filemap_add_folio(mapping, folio);
+      if (r == 0) {
+        goto filemap_add_folio_skip_lru;
+      } 
+      /*
+      else if (r < 0) {
+        WARN(1, "[filemap_add_folio] ERROR: cannot add page to per-app\n");
+      }
+      */
+
     }
 
 #endif

@@ -1048,7 +1048,7 @@ void release_pages(struct page **pages, int nr)
         }
 				//folio_clear_per_app(folio);
 				if (folio_test_lru(folio))
-					pr_warn("[release_pages] THIS PAGE IS BOTH IN PER-APP AND LRU\n");
+					//pr_warn("[release_pages] THIS PAGE IS BOTH IN PER-APP AND LRU\n");
 #ifdef CONFIG_PAPP_USE_KREF
 				per_app_put(app);
 #endif
@@ -1057,12 +1057,34 @@ void release_pages(struct page **pages, int nr)
 				goto skip_lru_del;
 			} else {
 				// how come there is no per_app? What is this process?
-				pr_warn("<<<<<<<APP: %s (uid %u, pid %d, app %p)>>>>>>>>>>>\n",
+        /*
+				pr_warn("<<<<<<<APP: %s (uid %u, pid %d, app %p) with %s page>>>>>>>>>>>\n",
 					current->comm,
 					from_kuid(&init_user_ns,
 						  task_uid(current)),
-					current->pid, (void *)app);
-				BUG();
+					current->pid, (void *)app, folio_test_anon(folio) ? "anon" : "file");
+				*/
+        //BUG();
+
+        // so turns out, when I do drop_caches, the file pages in page caches are dropped,
+        // and if they are per-app managed, it reaches here.
+
+        // there are 2 options:
+        // 1) don't free them -> this will result in unresolved memory pressure
+        // 2) just call list_del() -> this will result in incorrect accounting, since we cannot
+        // find the corresponding per_app and update its nr_pages
+
+        // for now, I think option 2 is more safe (but may waste CPU cycles during reclaim.. :(
+
+        folio_lock(folio);
+        /*
+        if (unlikely(folio_test_anon(folio))) {
+          pr_warn("[release_pages] anon page being released without per_app?\n");
+        }
+        */
+        list_del_init(&folio->lru);
+        ClearPagePerApp(&folio->page);
+        folio_unlock(folio);
 			}
 		}
 check_lru:

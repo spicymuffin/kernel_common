@@ -516,6 +516,22 @@ int commit_creds(struct cred *new)
 	alter_cred_subscribers(old, -2);
 
 #ifdef CONFIG_PAPP
+
+  /* filter applications of interest */
+  // temp: if uid is 0 and task->comm is "anon_program"..
+  if ( from_kuid(&init_user_ns, new->uid) == 0 && strcmp(task->comm, "anon_program") == 0) { 
+    pr_info("[cred] CREATING PER_APP FOR TOY PROGRAM\n");
+    app = per_app_find(task_tgid_nr(task));
+    if (likely(!app)) {
+      app = per_app_create(task);
+      if (!app) {
+        BUG();
+      }
+    } else {
+      BUG();
+    }
+  }
+
   /* Debug: Print UID changes for per-app debugging */
   if (!uid_eq(old->uid, new->uid) && per_app_is_target_uid(from_kuid(&init_user_ns, new->uid))) {
 #ifdef CONFIG_DEBUG_PAPP
