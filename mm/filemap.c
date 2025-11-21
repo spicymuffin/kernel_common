@@ -57,6 +57,10 @@
 #include <linux/per_app.h>
 #endif
 
+#ifdef CONFIG_TRACK_FILES
+#include <linux/track_files.h>
+#endif
+
 /*
  * FIXME: remove all knowledge of the buffer layer from the core VM
  */
@@ -3262,6 +3266,12 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	if (unlikely(index >= max_idx))
 		return VM_FAULT_SIGBUS;
+
+#ifdef CONFIG_TRACK_FILES
+  if (file && should_track_current_task()) {
+    track_file_if_new(file);
+  }
+#endif /* CONFIG_TRACK_FILES */
 
 	/*
 	 * Do we have something in the page cache already?

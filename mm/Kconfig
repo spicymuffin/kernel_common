@@ -54,6 +54,12 @@ config MEASURE_RMAP
   help
     This option measures rmap_walk overhead
 
+config TRACK_FILES
+  bool "Track unique files accessed by an app"
+  default n
+  help
+    This option tracks all unique files being accessed by an application through UID
+
 menuconfig SWAP
 	bool "Support for paging of anonymous memory (swap)"
 	depends on MMU && BLOCK && !ARCH_NO_SWAP

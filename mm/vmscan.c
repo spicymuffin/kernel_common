@@ -6557,6 +6557,9 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	struct mem_cgroup *target_memcg = sc->target_mem_cgroup;
 	struct mem_cgroup *memcg;
 
+  // debug
+  pr_info("[shrink_node_memcgs] function is called\n");
+
 	memcg = mem_cgroup_iter(target_memcg, NULL, NULL);
 	do {
 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
@@ -6600,6 +6603,9 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 
 		reclaimed = sc->nr_reclaimed;
 		scanned = sc->nr_scanned;
+    
+    // debug
+    pr_info("[shrink_node_memcgs] memcg: 0x%p, lruvec: 0x%p\n", memcg, lruvec);
 
 		shrink_lruvec(lruvec, sc);
 
