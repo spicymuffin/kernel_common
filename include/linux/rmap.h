@@ -203,6 +203,9 @@ void page_add_file_rmap(struct page *, struct vm_area_struct *,
 		bool compound);
 void page_remove_rmap(struct page *, struct vm_area_struct *,
 		bool compound);
+#ifdef CONFIG_PAPP
+void page_remove_rmap_lazy(struct page *, bool compound);
+#endif /* CONFIG_PAPP */
 
 void hugepage_add_anon_rmap(struct page *, struct vm_area_struct *,
 		unsigned long address, rmap_t flags);

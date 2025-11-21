@@ -983,12 +983,24 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	if (page && PageAnon(page)) {
 #ifdef CONFIG_PAPP
     if (PagePerApp(page)) {
+      // restore anon_vma reverse mapping
+      struct anon_vma *anon_vma;
+      if (unlikely(!src_vma->anon_vma)) {
+        BUG();
+      }
+      anon_vma = (void *)src_vma->anon_vma->root + PAGE_MAPPING_ANON;
+      // lock_page(page);
+      WRITE_ONCE(page->mapping, (struct address_space *)anon_vma);
+      page->index = linear_page_index(src_vma, addr);
+      //unlock_page(page);
+
+      // move page to LRU
       app = per_app_get_current();
-      if (app) {
+      if (likely(app)) {
         per_app_move_page_to_lru(app, page, src_vma);
       } else {
         WARN(1, "[copy_present_pte]: anon page is per_app, but no per_app struct exists\n");
-      }    
+      }
     }    
 #endif
 		/*
@@ -1008,8 +1020,9 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	} else if (page) {
 #ifdef CONFIG_PAPP
     if (PagePerApp(page)) {
+      // move page to LRU
       app = per_app_get_current();
-      if (app) {
+      if (likely(app)) {
         per_app_move_page_to_lru(app, page, src_vma);
       } else {
         WARN(1, "[copy_present_pte]: file page is per_app, but no per_app struct exists\n");
@@ -3305,14 +3318,15 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		 * some TLBs while the old PTE remains in others.
 		 */
 		ptep_clear_flush_notify(vma, vmf->address, vmf->pte);
-		page_add_new_anon_rmap(new_page, vma, vmf->address);
 #ifdef CONFIG_PAPP
     app = per_app_get_current();
     if (app) {
       per_app_add_page_vma(new_page, vma, app);
+      page_add_new_anon_rmap_lazy(new_page, vma, vmf->address, vmf->pte);
       goto wp_page_copy_set_pte;
     }
 #endif
+		page_add_new_anon_rmap(new_page, vma, vmf->address);
 		lru_cache_add_inactive_or_unevictable(new_page, vma);
 #ifdef CONFIG_PAPP
 wp_page_copy_set_pte:
@@ -4363,42 +4377,26 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	}
 
 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
-	/*
-	#ifdef CONFIG_PAPP
-			app = per_app_get_current();
-			if (app) {
-				per_app_add_new_anon_rmap_vma(page, vma, vmf->address);
-				per_app_add_page_vma(page, vma, app);
-	#ifdef CONFIG_PAPP_USE_KREF
-				per_app_put(app);
-	#endif
-				goto setpte;
-			}
-	#endif
-	*/
-	page_add_new_anon_rmap(page, vma, vmf->address);
 #ifdef CONFIG_PAPP
-	/* temp: only adding per-app page to list, no rmap */
 	app = per_app_get_current();
 	if (app) {
-		folio_lock(page_folio(page));
-
-		if (per_app_add_page_vma(page, vma, app)) {
+		//folio_lock(page_folio(page));
+    page_add_new_anon_rmap_lazy(page, vma, vmf->address, vmf->pte);
+		if (unlikely(per_app_add_page_vma(page, vma, app))) {
 			// this is error: page could not be added.. handle this
 			pr_warn("[perapp] PAGE COULD NOT BE ADDED TO PAGE LIST\n");
 #ifdef CONFIG_PAPP_USE_KREF
 			per_app_put(app);
 #endif
 		}
-
-		folio_unlock(page_folio(page));
-
+		//folio_unlock(page_folio(page));
 #ifdef CONFIG_PAPP_USE_KREF
 		per_app_put(app);
 #endif
 		goto setpte;
 	}
-#endif
+#endif /* CONFIG_PAPP */
+	page_add_new_anon_rmap(page, vma, vmf->address);
 	lru_cache_add_inactive_or_unevictable(page, vma);
 setpte:
 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);

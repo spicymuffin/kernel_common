@@ -546,6 +546,25 @@ static inline void mmu_notifier_range_init_owner(
 	range->owner = owner;
 }
 
+#ifdef CONFIG_PAPP
+/*
+ * Lazy rmap version that takes mm_struct directly instead of VMA.
+ */
+#define ptep_clear_flush_young_notify_lazy(__mm, __address, __ptep)  \
+({                 \
+  int __young;              \
+  struct mm_struct *___mm = __mm;         \
+  unsigned long ___address = __address;       \
+  pte_t *___ptep = __ptep;          \
+                 \
+  __young = ptep_clear_flush_young_lazy(___mm, ___address, ___ptep);  \
+  __young |= mmu_notifier_clear_flush_young(___mm,    \
+             ___address,   \
+             ___address + PAGE_SIZE); \
+  __young;              \
+})
+#endif /* CONFIG_PAPP */
+
 #define ptep_clear_flush_young_notify(__vma, __address, __ptep)		\
 ({									\
 	int __young;							\

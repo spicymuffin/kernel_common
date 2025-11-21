@@ -78,6 +78,10 @@
 
 #include <asm/tlbflush.h>
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif /* CONFIG_PAPP */
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/tlb.h>
 #include <trace/events/migrate.h>
@@ -86,6 +90,117 @@
 #include <trace/hooks/vmscan.h>
 
 #include "internal.h"
+
+#ifdef CONFIG_MEASURE_RMAP
+#include <linux/ktime.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+
+DEFINE_PER_CPU(struct rmap_stats, rmap_stats);
+#ifdef CONFIG_PAPP
+DEFINE_PER_CPU(struct lazy_rmap_stats, lazy_rmap_stats);
+#endif /* CONFIG_PAPP */
+
+// Helper macros to reduce code duplication
+#define RMAP_STATS_START() u64 __rmap_start = ktime_get_ns()
+
+#define RMAP_STATS_END(stats_var) \
+  do { \
+    u64 __rmap_duration = ktime_get_ns() - __rmap_start; \
+    this_cpu_add(stats_var.total_time, __rmap_duration); \
+    this_cpu_inc(stats_var.total_count); \
+  } while (0)
+#define RMAP_STATS_REF(stats_var) this_cpu_inc(stats_var.referenced_count);
+#define RMAP_STATS_UNMAP(stats_var) this_cpu_inc(stats_var.unmap_count);
+
+/*
+ * Procfs interface for reading rmap walk statistics
+ */
+static int rmap_stats_show(struct seq_file *m, void *v)
+{
+  u64 total_time = 0, total_count = 0;
+  u64 referenced_count = 0, unmap_count = 0;
+  u64 avg_time_ns = 0;
+  int cpu;
+
+  /* Aggregate regular rmap stats from all CPUs */
+  for_each_possible_cpu(cpu) {
+    struct rmap_stats *stats = per_cpu_ptr(&rmap_stats, cpu);
+    total_time += stats->total_time;
+    total_count += stats->total_count;
+    referenced_count += stats->referenced_count;
+    unmap_count += stats->unmap_count;
+  }
+
+  if (total_count > 0)
+    avg_time_ns = total_time / total_count;
+
+  seq_printf(m, "Regular Rmap Walk Statistics:\n");
+  seq_printf(m, "  total_walks:        %llu\n", total_count);
+  seq_printf(m, "  total_time_ns:      %llu\n", total_time);
+  seq_printf(m, "  avg_time_ns:        %llu\n", avg_time_ns);
+  seq_printf(m, "  referenced_count:   %llu\n", referenced_count);
+  seq_printf(m, "  unmap_count:        %llu\n", unmap_count);
+
+#ifdef CONFIG_PAPP
+  /* Aggregate lazy rmap stats from all CPUs */
+  total_time = 0;
+  total_count = 0;
+  referenced_count = 0;
+  unmap_count = 0;
+  avg_time_ns = 0;
+
+  for_each_possible_cpu(cpu) {
+    struct lazy_rmap_stats *stats = per_cpu_ptr(&lazy_rmap_stats, cpu);
+    total_time += stats->total_time;
+    total_count += stats->total_count;
+    referenced_count += stats->referenced_count;
+    unmap_count += stats->unmap_count;
+  }
+
+  if (total_count > 0)
+    avg_time_ns = total_time / total_count;
+
+  seq_printf(m, "\nLazy Rmap Walk Statistics:\n");
+  seq_printf(m, "  total_walks:        %llu\n", total_count);
+  seq_printf(m, "  total_time_ns:      %llu\n", total_time);
+  seq_printf(m, "  avg_time_ns:        %llu\n", avg_time_ns);
+  seq_printf(m, "  referenced_count:   %llu\n", referenced_count);
+  seq_printf(m, "  unmap_count:        %llu\n", unmap_count);
+#endif /* CONFIG_PAPP */
+
+  return 0;
+}
+
+static int rmap_stats_open(struct inode *inode, struct file *file)
+{
+  return single_open(file, rmap_stats_show, NULL);
+}
+
+static const struct proc_ops rmap_stats_proc_ops = {
+  .proc_open  = rmap_stats_open,
+  .proc_read  = seq_read,
+  .proc_lseek = seq_lseek,
+  .proc_release = single_release,
+};
+
+static int __init rmap_stats_init(void)
+{
+  proc_create("rmap_stats", 0444, NULL, &rmap_stats_proc_ops);
+  return 0;
+}
+late_initcall(rmap_stats_init);
+
+#else 
+
+#define RMAP_STATS_START() do { } while (0)
+#define RMAP_STATS_END(stats_var) do { } while (0)
+#define RMAP_STATS_REF(stats_var) do { } while (0)
+#define RMAP_STATS_UNMAP(stats_var) do { } while (0)
+
+#endif /* CONFIG_MEASURE_RMAP */
+
+
 
 static struct kmem_cache *anon_vma_cachep;
 static struct kmem_cache *anon_vma_chain_cachep;
@@ -834,6 +949,399 @@ struct folio_referenced_arg {
 	unsigned long vm_flags;
 	struct mem_cgroup *memcg;
 };
+
+#ifdef CONFIG_PAPP
+static bool folio_referenced_one_lazy(struct folio *folio, struct vm_area_struct *vma,
+    unsigned long address, void *arg)
+{
+  struct folio_referenced_arg *pra = arg; // mapcount, memcg
+  struct page *page = &folio->page;
+  pte_t *ptep;
+  pte_t pte;
+  struct mm_struct *mm;
+  spinlock_t *ptl;
+  int referenced = 0;
+
+  RMAP_STATS_REF(lazy_rmap_stats);
+  
+  //pr_info_once("[LAZY] folio_referenced_one_lazy\n");
+
+  VM_BUG_ON_PAGE(!(PagePerApp(page) && PageAnon(page)), page);
+  /*
+  if (pra->mapcount > 1 || folio_mapcount(folio) > 1) {
+    pr_info("[LAZY] folio_referenced_one_lazy: initial mapcount = %d, folio_mapcount = %d\n", 
+            pra->mapcount, folio_mapcount(folio));
+  }
+  */
+  
+  ptep = page_pte_lazy(page);
+  
+  if (unlikely(page != pte_page(*ptep)))
+    BUG();
+
+  //mm = vma->vm_mm;
+  mm = get_page_mm(ptep);
+
+  //if (unlikely(!ptep || !vma || !mm)) {
+  if (unlikely(!ptep || !mm)) {
+    WARN_ON_ONCE(1);
+    return false;
+  }
+  
+  /*
+  if (unlikely(address < vma->vm_start || address >= vma->vm_end)) {
+    //pr_info_once("[LAZY] folio_referenced_one_lazy: invalid vma\n");
+    return false;
+  }
+  */
+  /*
+  if (vma->vm_flags & VM_LOCKED) {
+    mlock_vma_folio(folio, vma, false);
+    pra->vm_flags |= VM_LOCKED;
+    //pr_info_once("[LAZY] folio_referenced_one_lazy: mlocked\n");
+    return false;
+  }
+  */
+  if (folio_test_mlocked(folio)) {
+    struct vm_area_struct *vma = find_vma(mm, address);
+    if (!vma)
+      BUG();
+    mlock_vma_folio(folio, vma, false);
+    pra->vm_flags |= VM_LOCKED;
+    return false;
+  }
+
+
+  //ptl = pte_lockptr(mm, pmd); // 1) expects PMD as function parameter
+  //ptl = &mm->page_table_lock; // 2) cannot use if split lock enabled (when CPUs >= 4)
+  ptl = &virt_to_page(ptep)->ptl;
+  spin_lock(ptl);
+
+  pte = *ptep;
+
+  if (unlikely(!pte_present(pte) ||
+        pte_pfn(pte) != page_to_pfn(page))) {
+    spin_unlock(ptl);
+    //pr_info_once("[LAZY] folio_referenced_one_lazy: pte issue\n");
+    return false;
+  }
+
+  if (lru_gen_enabled() && pte_young(pte)) {
+    // this shouldn't be triggered
+    BUG();
+    referenced++;
+  }
+  
+  /*
+  if (ptep_clear_flush_young_notify(vma, address, ptep)) {
+    referenced++;
+  }
+  */
+  if (ptep_clear_flush_young_notify_lazy(mm, address, ptep)) {
+    referenced++;
+  }
+
+
+  spin_unlock(ptl);
+  if (referenced)
+    folio_clear_idle(folio);
+
+  if (folio_test_clear_young(folio))
+    referenced++;
+
+  if (referenced) {
+    pra->referenced++;
+    // TODO: not sure how to handle this code below.. what is this anyway?
+    //pra->vm_flags |= vma->vm_flags & ~VM_LOCKED;
+  }
+
+  /* Decrement mapcount after processing this mapping */
+  pra->mapcount--;
+
+  if (!pra->mapcount) {
+    //pr_info_once("[LAZY] folio_referenced_one_lazy: done with mapcount = 0\n");
+    return false;
+  }
+
+  //pr_info_once("[LAZY] folio_referenced_one_lazy: should continue?? mapcount: %d\n", pra->mapcount);
+  return true;
+}
+
+/*
+ * Fast path for try_to_unmap_one for lazy pages
+ * @arg: enum ttu_flags will be passed to this argument
+ */
+static bool try_to_unmap_one_lazy(struct folio *folio, struct vm_area_struct *vma,
+                                   unsigned long address, void *arg)
+{
+  struct page *page = &folio->page;
+  struct mm_struct *mm;
+  pte_t *ptep;
+  pte_t pteval;
+  spinlock_t *ptl;
+  enum ttu_flags flags = (enum ttu_flags)(long)arg;
+  swp_entry_t entry;
+  pte_t swp_pte;
+  bool anon_exclusive;
+  bool ret = true;
+  struct mmu_notifier_range range;
+
+  RMAP_STATS_UNMAP(lazy_rmap_stats);
+
+  VM_BUG_ON_PAGE(!(PagePerApp(page) && PageAnon(page)), page);
+  
+  //pr_info_once("[LAZY] try_to_unmap_one_lazy\n");
+  
+  /* Get PTE directly from lazy rmap storage */
+  ptep = page_pte_lazy(page);
+  
+  if (unlikely(page != pte_page(*ptep)))
+    BUG();
+  
+  mm = get_page_mm(ptep);
+
+  /*
+  if (!vma)
+    vma = page->vma;
+  */
+
+  if (unlikely(!ptep || !mm)) {
+    WARN_ON_ONCE(1);
+    return false;
+  }
+  
+  /* Validate address is within VMA bounds */
+  /*
+  if (unlikely(address < vma->vm_start || address >= vma->vm_end)) {
+    //pr_info_once("[LAZY] try_to_unmap_one_lazy: invalid vma\n");
+    return false;
+  }
+  */
+  /* Initialize MMU notifier range for single page */
+  //mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, mm,
+  //                        address, address + PAGE_SIZE);
+  mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, NULL, mm,
+                          address, address + PAGE_SIZE);
+  mmu_notifier_invalidate_range_start(&range);
+  
+  /* Check for VM_LOCKED - must not swap out mlocked pages */
+  /*
+  if (!(flags & TTU_IGNORE_MLOCK) && (vma->vm_flags & VM_LOCKED)) {
+    mlock_vma_folio(folio, vma, false);
+    mmu_notifier_invalidate_range_end(&range);
+    //pr_info_once("[LAZY] try_to_unmap_one_lazy: mlocked\n");
+    return false;
+  }*/
+  if (!(flags & TTU_IGNORE_MLOCK) && folio_test_mlocked(folio)) {
+    struct vm_area_struct *vma = find_vma(mm, address);
+    if (!vma)
+      BUG();
+    mlock_vma_folio(folio, vma, false);
+    mmu_notifier_invalidate_range_end(&range);
+    return false;
+  }
+  
+  /* Get the page table lock */
+  ptl = &virt_to_page(ptep)->ptl;
+  spin_lock(ptl);
+  
+  /* Read the PTE */
+  pteval = *ptep;
+  
+  /* Verify PTE is present and points to our page */
+  if (unlikely(!pte_present(pteval) || pte_pfn(pteval) != page_to_pfn(page))) {
+    spin_unlock(ptl);
+    mmu_notifier_invalidate_range_end(&range);
+    //pr_info_once("[LAZY] try_to_unmap_one_lazy: pte mismatch\n");
+    return false;
+  }
+  
+  /* Check if page is exclusively mapped */
+  anon_exclusive = PageAnonExclusive(page);
+ 
+  // lazy page should not have hugetlb
+  if (folio_test_hugetlb(folio)) {
+    BUG();
+  }
+
+  /* Flush cache before clearing PTE */
+  //flush_cache_page(vma, address, pte_pfn(pteval));
+  flush_cache_page(NULL, address, pte_pfn(pteval));
+  
+  /* Clear the PTE - use deferred flush if supported */
+  if (should_defer_flush(mm, flags)) {
+    pteval = ptep_get_and_clear(mm, address, ptep);
+    set_tlb_ubc_flush_pending(mm, pte_dirty(pteval));
+  } else {
+    //pteval = ptep_clear_flush(vma, address, ptep);
+    pteval = ptep_clear_flush_lazy(mm, address, ptep);
+  }
+ 
+  // PTE is cleared now
+
+  /* Handle uffd-wp marker if needed */
+  /*
+   * Only if vma is not anonymous AND userfault wp protected (VM_UFFD_WP)
+   * lazy pages are most likely anonymous, so skip it
+   */
+  //pte_install_uffd_wp_if_needed(vma, address, ptep, pteval);
+  
+
+  /* Set dirty flag on folio if PTE was dirty */
+  if (pte_dirty(pteval))
+    folio_mark_dirty(folio);
+  
+  /* Update RSS high watermark */
+  update_hiwater_rss(mm);
+  
+  /* Handle different unmap scenarios */
+  if (PageHWPoison(page) && (flags & TTU_HWPOISON)) {
+    /* Hardware poison - create hwpoison swap entry */
+    pteval = swp_entry_to_pte(make_hwpoison_entry(page));
+    if (folio_test_hugetlb(folio)) {
+      BUG();
+    }
+    dec_mm_counter(mm, mm_counter(&folio->page));
+    set_pte_at(mm, address, ptep, pteval);
+    
+  //} else if (pte_unused(pteval) && !userfaultfd_armed(vma)) {
+  } else if (pte_unused(pteval) && !pte_uffd_wp(pteval)) {
+    /* Guest indicated page is unused - just discard */
+    dec_mm_counter(mm, MM_ANONPAGES);
+    /* Invalidate as we cleared the pte */
+    mmu_notifier_invalidate_range(mm, address, address + PAGE_SIZE);
+    
+  } else {
+    /* Normal case: create swap entry for anonymous page */
+    if (unlikely(folio_test_swapbacked(folio) != folio_test_swapcache(folio))) {
+      WARN_ON_ONCE(1);
+      ret = false;
+      /* Restore PTE and unlock */
+      set_pte_at(mm, address, ptep, pteval);
+      /* We have to invalidate as we cleared the pte */
+      mmu_notifier_invalidate_range(mm, address, address + PAGE_SIZE);
+      spin_unlock(ptl);
+      mmu_notifier_invalidate_range_end(&range);
+      return ret;
+    }
+    
+    /* MADV_FREE page check */
+    if (!folio_test_swapbacked(folio)) {
+      int ref_count, map_count;
+      
+      /* Synchronize with gup_pte_range() */
+      smp_mb();
+      ref_count = folio_ref_count(folio);
+      map_count = folio_mapcount(folio);
+      smp_rmb();
+      
+      /* Check if page can be discarded (MADV_FREE and clean) */
+      if (ref_count == 1 + map_count && !folio_test_dirty(folio)) {
+        dec_mm_counter(mm, MM_ANONPAGES);
+        /* Invalidate as we cleared the pte */
+        mmu_notifier_invalidate_range(mm, address, address + PAGE_SIZE);
+        goto discard;
+      }
+      
+      /* Page was redirtied - restore and mark as swapbacked */
+      set_pte_at(mm, address, ptep, pteval);
+      folio_set_swapbacked(folio);
+      ret = false;
+      spin_unlock(ptl);
+      mmu_notifier_invalidate_range_end(&range);
+      return ret;
+    }
+    
+    /* Get swap entry (from page->private for swapcache) */
+    entry = (swp_entry_t){ .val = page_private(page) };
+    
+    /* Duplicate swap entry */
+    if (swap_duplicate(entry) < 0) {
+      set_pte_at(mm, address, ptep, pteval);
+      ret = false;
+      spin_unlock(ptl);
+      mmu_notifier_invalidate_range_end(&range);
+      return ret;
+    }
+    
+    /* Architecture-specific unmap hook */
+    //if (arch_unmap_one(mm, vma, address, pteval) < 0) {
+    if (arch_unmap_one(mm, NULL, address, pteval) < 0) {
+      swap_free(entry);
+      set_pte_at(mm, address, ptep, pteval);
+      ret = false;
+      spin_unlock(ptl);
+      mmu_notifier_invalidate_range_end(&range);
+      return ret;
+    }
+    
+    /* Handle exclusive mapping - see page_try_share_anon_rmap() */
+    if (anon_exclusive && page_try_share_anon_rmap(page)) {
+      swap_free(entry);
+      set_pte_at(mm, address, ptep, pteval);
+      ret = false;
+      spin_unlock(ptl);
+      mmu_notifier_invalidate_range_end(&range);
+      return ret;
+    }
+    
+    /* Add mm to mmlist if not already there (for swapoff) */
+    if (list_empty(&mm->mmlist)) {
+      spin_lock(&mmlist_lock);
+      if (list_empty(&mm->mmlist))
+        list_add(&mm->mmlist, &init_mm.mmlist);
+      spin_unlock(&mmlist_lock);
+    }
+    
+    /* Update counters */
+    dec_mm_counter(mm, MM_ANONPAGES);
+    inc_mm_counter(mm, MM_SWAPENTS);
+    
+    /* Build swap PTE */
+    swp_pte = swp_entry_to_pte(entry);
+    
+    /* Preserve exclusive mapping flag if supported */
+    if (anon_exclusive)
+      swp_pte = pte_swp_mkexclusive(swp_pte);
+      
+    /* Preserve soft-dirty flag */
+    if (pte_soft_dirty(pteval))
+      swp_pte = pte_swp_mksoft_dirty(swp_pte);
+      
+    /* Preserve uffd-wp flag */
+    if (pte_uffd_wp(pteval))
+      swp_pte = pte_swp_mkuffd_wp(swp_pte);
+    
+    /* Install swap PTE */
+    set_pte_at(mm, address, ptep, swp_pte);
+    /* Invalidate as we cleared the pte */
+    mmu_notifier_invalidate_range(mm, address, address + PAGE_SIZE);
+  }
+
+discard:
+  /* Release the lock */
+  spin_unlock(ptl);
+  
+  /* Remove rmap */
+  //page_remove_rmap(page, vma, false);
+  page_remove_rmap_lazy(page, false);
+
+  /* Handle mlock drainage if needed */
+  //if (vma->vm_flags & VM_LOCKED)
+  if (folio_test_mlocked(folio))
+    mlock_page_drain_local();
+  
+  /* Drop page reference */
+  folio_put(folio);
+  
+  mmu_notifier_invalidate_range_end(&range);
+  
+  //pr_info_once("[LAZY] try_to_unmap_one_lazy: done\n");
+  /* Lazy pages have only one mapping - always stop after processing */
+  return false;
+}
+#endif /* CONFIG_PAPP */
+
 /*
  * arg: folio_referenced_arg will be passed
  */
@@ -843,6 +1351,8 @@ static bool folio_referenced_one(struct folio *folio,
 	struct folio_referenced_arg *pra = arg;
 	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, address, 0);
 	int referenced = 0;
+
+  RMAP_STATS_REF(rmap_stats);
 
 	while (page_vma_mapped_walk(&pvmw)) {
 		address = pvmw.address;
@@ -958,6 +1468,19 @@ int folio_referenced(struct folio *folio, int is_locked,
 		if (!we_locked)
 			return 1;
 	}
+
+#ifdef CONFIG_PAPP
+  if (folio_test_per_app(folio) && folio_test_anon(folio)) {
+    struct page *page = &folio->page;
+    pte_t *ptep = page_pte_lazy(page);
+    if (unlikely(page != pte_page(*ptep))) {
+      pr_info("[REF: PTE <--> PAGE is not established]\n");
+      restore_anon_vma_lazy(page);
+    } else {
+      rwc.rmap_one = folio_referenced_one_lazy;
+    }
+  }
+#endif /* CONFIG_PAPP */
 
 	rmap_walk(folio, &rwc);
 	*vm_flags = pra.vm_flags;
@@ -1494,6 +2017,38 @@ out:
 	munlock_vma_page(page, vma, compound);
 }
 
+#ifdef CONFIG_PAPP
+void page_remove_rmap_lazy(struct page *page, bool compound)
+{
+  lock_page_memcg(page);
+
+  if (!PageAnon(page)) {
+    page_remove_file_rmap(page, compound);
+    goto out;
+  }
+
+  if (compound) {
+    page_remove_anon_compound_rmap(page);
+    goto out;
+  }
+
+  if (!atomic_add_negative(-1, &page->_mapcount))
+    goto out;
+
+  __dec_lruvec_page_state(page, NR_ANON_MAPPED);
+
+  if (PageTransCompound(page))
+    deferred_split_huge_page(compound_head(page));
+
+out:
+  unlock_page_memcg(page);
+
+  //munlock_vma_page(page, vma, compound);
+  if (unlikely(PageMlocked(page) && (compound || !PageTransCompound(page))))
+    munlock_page(page);
+}
+#endif /* CONFIG_PAPP */
+
 /*
  * @arg: enum ttu_flags will be passed to this argument
  */
@@ -1507,6 +2062,8 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 	bool anon_exclusive, ret = true;
 	struct mmu_notifier_range range;
 	enum ttu_flags flags = (enum ttu_flags)(long)arg;
+  
+  RMAP_STATS_UNMAP(rmap_stats);
 
 	/*
 	 * When racing against e.g. zap_pte_range() on another cpu,
@@ -1856,6 +2413,19 @@ void try_to_unmap(struct folio *folio, enum ttu_flags flags)
 		.done = page_not_mapped,
 		.anon_lock = folio_lock_anon_vma_read,
 	};
+
+#ifdef CONFIG_PAPP
+  if (folio_test_per_app(folio) && folio_test_anon(folio)) {
+    struct page *page = &folio->page;
+    pte_t *ptep = page_pte_lazy(page);
+    if (unlikely(page != pte_page(*ptep))) {
+      pr_info("[TTUM: PTE <--> PAGE is not established]\n");
+      restore_anon_vma_lazy(page);
+    } else {
+      rwc.rmap_one = try_to_unmap_one_lazy;
+    }
+  }
+#endif /* CONFIG_PAPP */
 
 	if (flags & TTU_RMAP_LOCKED)
 		rmap_walk_locked(folio, &rwc);
@@ -2399,6 +2969,35 @@ int make_device_exclusive_range(struct mm_struct *mm, unsigned long start,
 EXPORT_SYMBOL_GPL(make_device_exclusive_range);
 #endif
 
+#ifdef CONFIG_PAPP
+// only called for anonymous, per-app page
+void rmap_walk_anon_lazy(struct folio *folio, struct rmap_walk_control *rwc, bool locked)
+{
+  struct page *page = folio_page(folio, 0);
+  //struct vm_area_struct *vma = page->vma;
+  unsigned long address = page->index;
+
+  /*
+  if (unlikely(!vma || !vma->vm_mm)) {
+    BUG();
+  }
+  */
+
+  /*
+  if (rwc->invalid_vma && rwc->invalid_vma(vma, rwc->arg))
+    goto done;
+  */
+
+  //if (!rwc->rmap_one(folio, vma, address, rwc->arg))
+  if (!rwc->rmap_one(folio, NULL, address, rwc->arg))
+    goto done;
+  if (rwc->done && rwc->done(folio))
+    goto done;
+done:
+  return;
+}
+#endif /* CONFIG_PAPP */
+
 void __put_anon_vma(struct anon_vma *anon_vma)
 {
 	struct anon_vma *root = anon_vma->root;
@@ -2566,9 +3165,26 @@ void rmap_walk(struct folio *folio, struct rmap_walk_control *rwc)
 {
 	if (unlikely(folio_test_ksm(folio)))
 		rmap_walk_ksm(folio, rwc);
-	else if (folio_test_anon(folio))
-		rmap_walk_anon(folio, rwc, false);
-	else
+#ifdef CONFIG_PAPP
+  else if (folio_test_anon(folio)) {
+    if (folio_test_per_app(folio)) {
+      RMAP_STATS_START();
+      rmap_walk_anon_lazy(folio, rwc, false);
+      RMAP_STATS_END(lazy_rmap_stats);
+    } else {
+      RMAP_STATS_START();
+      rmap_walk_anon(folio, rwc, false);
+      RMAP_STATS_END(rmap_stats);
+    }
+  }
+#else
+  else if (folio_test_anon(folio)) {
+    RMAP_STATS_START();
+    rmap_walk_anon(folio, rwc, false);
+    RMAP_STATS_END(rmap_stats);
+  }
+#endif /* CONFIG_PAPP */
+  else
 		rmap_walk_file(folio, rwc, false);
 }
 
@@ -2577,9 +3193,26 @@ void rmap_walk_locked(struct folio *folio, struct rmap_walk_control *rwc)
 {
 	/* no ksm support for now */
 	VM_BUG_ON_FOLIO(folio_test_ksm(folio), folio);
-	if (folio_test_anon(folio))
-		rmap_walk_anon(folio, rwc, true);
-	else
+#ifdef CONFIG_PAPP
+  if (folio_test_anon(folio)) {
+    if (folio_test_per_app(folio)) {
+      RMAP_STATS_START();
+      rmap_walk_anon_lazy(folio, rwc, true);
+      RMAP_STATS_END(lazy_rmap_stats);
+    } else {
+      RMAP_STATS_START();
+      rmap_walk_anon(folio, rwc, true);
+      RMAP_STATS_END(rmap_stats);
+    }
+  }
+#else
+  if (folio_test_anon(folio)) {
+    RMAP_STATS_START();
+    rmap_walk_anon(folio, rwc, true);
+    RMAP_STATS_END(rmap_stats);
+  }
+#endif /* CONFIG_PAPP */
+  else
 		rmap_walk_file(folio, rwc, true);
 }
 

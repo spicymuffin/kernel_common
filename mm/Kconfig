@@ -48,6 +48,12 @@ config PAPP_USE_2Q
   help
     2-queue
 
+config MEASURE_RMAP
+  bool "Measure reverse map walking overhead"
+  default n
+  help
+    This option measures rmap_walk overhead
+
 menuconfig SWAP
 	bool "Support for paging of anonymous memory (swap)"
 	depends on MMU && BLOCK && !ARCH_NO_SWAP

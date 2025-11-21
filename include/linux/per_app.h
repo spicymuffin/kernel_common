@@ -12,6 +12,9 @@
 #include <linux/android_vendor.h>
 #include <linux/memcontrol.h>
 
+#include <linux/mm.h>
+#include <linux/sched.h>
+
 #ifdef CONFIG_PAPP_USE_KREF
 #include <linux/kref.h>
 #endif
@@ -206,6 +209,7 @@ static inline void __per_app_init_vendor_data(struct task_struct *task)
     android_init_vendor_data(task, 1);
 }
 
+
 // page flags for per-app pages
 #define APP_PAGE_ANON   (1 << 0)
 #define APP_PAGE_FILE   (1 << 1)
@@ -261,6 +265,30 @@ struct per_app *per_app_get_cached(struct task_struct *task);
 bool per_app_is_cached(struct task_struct *task);
 
 // reverse mapping
+
+// rmap-related inline functions
+// retrieve mm from page table page
+static inline struct mm_struct *get_page_mm(pte_t *ptep)
+{
+  return virt_to_page(ptep)->pt_mm;
+}
+
+pte_t *page_pte_lazy(struct page *page);
+
+void detect_lazy_process(struct task_struct *task);
+
+void page_set_anon_rmap_lazy(struct page *page, struct vm_area_struct *vma, unsigned long address,
+    pte_t *ptep, int exclusive);
+void page_add_new_anon_rmap_lazy(struct page *page, struct vm_area_struct *vma,
+    unsigned long address, pte_t *ptep);
+void page_add_anon_rmap_lazy(struct page *page, struct vm_area_struct *vma,
+    unsigned long address, pte_t *ptep, rmap_t flags);
+int restore_anon_vma_lazy(struct page *page);
+// for debug only
+void lazy_rmap_debug_event(struct page *page, const char *event, pte_t *new_ptep);
+void page_update_rmap_lazy(struct page *page, pte_t *ptep, unsigned long addr);
+
+// deprecated
 void per_app_add_new_anon_rmap_vma(struct page *page, struct vm_area_struct *vma, unsigned long address);
 void per_app_add_anon_rmap_vma(struct page *page, struct vm_area_struct *vma, unsigned long address, rmap_t flags);
 void per_app_set_anon_rmap_vma(struct page *page, struct vm_area_struct *vma, unsigned long address, int exclusive);

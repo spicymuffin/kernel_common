@@ -492,6 +492,178 @@ void per_app_try_to_update_position(int old_oom, int new_oom)
 
 /* REVERSE MAPPING */
 
+// maybe inline?
+pte_t *page_pte_lazy(struct page *page)
+{
+  unsigned long mapping = (unsigned long)page->mapping;
+  
+  if (!mapping) {
+    WARN(1, "PAGE MAPPING IS NULL\n");
+    return NULL;
+    // temp: the bug should be enabled later
+    //BUG();
+  }
+  if ((mapping & PAGE_MAPPING_FLAGS) != PAGE_MAPPING_ANON)
+    return NULL;
+  return (void *)(mapping - PAGE_MAPPING_ANON);
+}
+
+// page->mapping = ptep
+// page->index = address
+// also save VMA information somewhere (in struct page)
+void page_set_anon_rmap_lazy(struct page *page, struct vm_area_struct *vma,
+    unsigned long address, pte_t *ptep, int exclusive)
+{
+  struct anon_vma *anon_vma = vma->anon_vma;
+  
+  BUG_ON(!anon_vma);
+
+  if (PageAnon(page))
+    goto out;
+
+  // TODO: technically, there should be NO non-exclusive page here
+  if (likely(exclusive)) {
+    //pr_info_once("[LAZY] setting page->mapping as PTE\n");
+    
+    // single-mapped page: use lazy reverse mapping
+    WRITE_ONCE(page->mapping, (struct address_space *)((unsigned long)ptep | PAGE_MAPPING_ANON));
+    page->index = address; // not linear address
+  } else {
+    // shared page: use traditional anon_vma mapping
+    anon_vma = anon_vma->root;
+    anon_vma = (void *)anon_vma + PAGE_MAPPING_ANON;
+    WRITE_ONCE(page->mapping, (struct address_space *)anon_vma);
+    page->index = linear_page_index(vma, address);
+  }
+
+out:
+  if (exclusive)
+    SetPageAnonExclusive(page);
+}
+
+void page_add_new_anon_rmap_lazy(struct page *page, struct vm_area_struct *vma,
+    unsigned long address, pte_t *ptep)
+{
+  int nr = 1;
+
+  VM_BUG_ON_VMA(address < vma->vm_start || address >= vma->vm_end, vma);
+  BUG_ON(PageCompound(page));
+  
+  //pr_info_once("[LAZY] detected lazy page\n");
+
+  __SetPageSwapBacked(page);
+  atomic_set(&page->_mapcount, 0);
+  __mod_lruvec_page_state(page, NR_ANON_MAPPED, nr);
+  page_set_anon_rmap_lazy(page, vma, address, ptep, 1);
+}
+
+// equivalent to page_add_anon_rmap()
+// only used for exclusive, swapped-in page (in do_swap_page)
+void page_add_anon_rmap_lazy(struct page *page, struct vm_area_struct *vma,
+    unsigned long address, pte_t *ptep, rmap_t flags)
+{
+  bool compound = flags & RMAP_COMPOUND;
+  bool first;
+  int nr = compound ? thp_nr_pages(page) : 1;
+  
+  VM_BUG_ON_PAGE(!PageLocked(page), page);
+  
+  // Handle mapcount increment
+  if (compound) {
+    atomic_t *mapcount = compound_mapcount_ptr(page);
+    first = atomic_inc_and_test(mapcount);
+    // should not be compound page...
+    BUG();
+  } else {
+    first = atomic_inc_and_test(&page->_mapcount);
+  }
+  
+  // Validation: must be first mapping (guaranteed for exclusive swap-in)
+  VM_BUG_ON_PAGE(!first, page);
+  
+  // Update statistics (always, since always first mapping)
+  if (compound)
+    __mod_lruvec_page_state(page, NR_ANON_THPS, nr);
+  __mod_lruvec_page_state(page, NR_ANON_MAPPED, nr);
+  
+  WRITE_ONCE(page->mapping, 
+      (struct address_space *)((unsigned long)ptep | PAGE_MAPPING_ANON));
+  page->index = address;
+  SetPageAnonExclusive(page);
+  
+  mlock_vma_page(page, vma, compound);
+}
+
+int restore_anon_vma_lazy(struct page *page)
+{
+  pte_t *ptep;
+  struct mm_struct *mm;
+  struct vm_area_struct *vma;
+  struct anon_vma *anon_vma;
+  unsigned long address;
+  
+  //VM_BUG_ON_PAGE(!PageLocked(page), page); 
+  
+  ptep = page_pte_lazy(page);
+  mm = get_page_mm(ptep);
+  address = page->index;
+  vma = find_vma(mm, address);
+  
+  if (!mm) {
+    pr_info("INVALID mm\n");
+    //return 1;
+  }
+  if (!vma) {
+    pr_info("INVALID vma\n");
+  }
+  
+  anon_vma = vma->anon_vma->root;
+  BUG_ON(!anon_vma);
+  
+  lock_page(page);
+  anon_vma = (void *)anon_vma + PAGE_MAPPING_ANON;
+  WRITE_ONCE(page->mapping, (struct address_space *)anon_vma);
+  page->index = linear_page_index(vma, address);
+  unlock_page(page);
+
+  return 0;
+}
+
+// DEBUG
+void lazy_rmap_debug_event(struct page *page, const char *event, pte_t *new_ptep)
+{
+  pte_t *cached;
+
+  if (!PagePerApp(page) || !PageAnon(page))
+    return;
+  
+  pr_warn("[LAZY RMAP DEBUG EVENT]: anonymous and per-app page for event %s\n", event);
+
+  cached = page_pte_lazy(page);
+  if (!cached) {
+    pr_warn("[LAZY RMAP DEBUG EVENT]: page->mapping is NULL\n");
+    return;
+  }
+  if (page != pte_page(*cached)) {
+    pr_warn("[LAZY RMAP DEBUG EVENT]: at %s, page=%p ref=%d mapcount=%d old_ptep=%p new_ptep=%p\n",
+      event, page, page_ref_count(page), page_mapcount(page), cached, new_ptep);
+    dump_stack();
+  }
+}
+
+// END DEBUG
+
+/* update page->mapping to the new PTE pointer (e.g. in move_ptes() triggered by mremap) */
+void page_update_rmap_lazy(struct page *page, pte_t *ptep, unsigned long addr)
+{
+  BUG_ON(page != pte_page(*ptep));
+
+  WRITE_ONCE(page->mapping, (struct address_space *)((unsigned long)ptep | PAGE_MAPPING_ANON));
+  page->index = addr;
+}
+
+
+// -- DEPRECATED: we are now using PTE pointer instead of VMA --
 /*
  * page sanity check
  */
@@ -637,6 +809,7 @@ void per_app_restore_anon_rmap(struct page *page, struct vm_area_struct *vma)
   }
 }
 
+/* END OF REVERSE MAPPING */
 
 // return 0 on success
 int per_app_add_file_page(struct page *page, struct per_app *app) {

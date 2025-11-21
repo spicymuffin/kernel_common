@@ -205,6 +205,21 @@ static inline int pudp_set_access_flags(struct vm_area_struct *vma,
 #endif
 
 #ifndef __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
+
+#ifdef CONFIG_PAPP
+static inline int ptep_test_and_clear_young_lazy(struct mm_struct *mm,
+          unsigned long address, pte_t *ptep)
+{
+  pte_t pte = *ptep;
+  int r = 1;
+  if (!pte_young(pte))
+    r = 0;
+  else
+    set_pte_at(mm, address, ptep, pte_mkold(pte));
+  return r;
+}
+#endif /* CONFIG_PAPP */
+
 static inline int ptep_test_and_clear_young(struct vm_area_struct *vma,
 					    unsigned long address,
 					    pte_t *ptep)
@@ -245,6 +260,12 @@ static inline int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 #endif
 
 #ifndef __HAVE_ARCH_PTEP_CLEAR_YOUNG_FLUSH
+
+#ifdef CONFIG_PAPP
+int ptep_clear_flush_young_lazy(struct mm_struct *mm,
+          unsigned long address, pte_t *ptep);
+#endif /* CONFIG_PAPP */
+
 int ptep_clear_flush_young(struct vm_area_struct *vma,
 			   unsigned long address, pte_t *ptep);
 #endif
@@ -464,6 +485,12 @@ static inline void pte_clear_not_present_full(struct mm_struct *mm,
 #endif
 
 #ifndef __HAVE_ARCH_PTEP_CLEAR_FLUSH
+
+#ifdef CONFIG_PAPP
+extern pte_t ptep_clear_flush_lazy(struct mm_struct *mm,
+            unsigned long address, pte_t *ptep);
+#endif /* CONFIG_PAPP */
+
 extern pte_t ptep_clear_flush(struct vm_area_struct *vma,
 			      unsigned long address,
 			      pte_t *ptep);

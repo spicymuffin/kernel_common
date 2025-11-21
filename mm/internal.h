@@ -13,6 +13,27 @@
 #include <linux/rmap.h>
 #include <linux/tracepoint-defs.h>
 
+#ifdef CONFIG_MEASURE_RMAP
+#include <linux/percpu.h>
+struct rmap_stats {
+  u64 total_time;
+  u64 total_count;
+  u64 referenced_count;
+  u64 unmap_count;
+};
+DECLARE_PER_CPU(struct rmap_stats, rmap_stats);
+
+#ifdef CONFIG_PAPP
+struct lazy_rmap_stats {
+  u64 total_time;
+  u64 total_count;
+  u64 referenced_count;
+  u64 unmap_count;
+};
+DECLARE_PER_CPU(struct lazy_rmap_stats, lazy_rmap_stats);
+#endif /* CONFIG_PAPP */
+#endif /* CONFIG_MEASURE_RMAP */
+
 struct folio_batch;
 
 /*

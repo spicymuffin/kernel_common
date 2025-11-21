@@ -67,7 +67,9 @@ static inline pgtable_t __pte_alloc_one(struct mm_struct *mm, gfp_t gfp)
 		__free_page(pte);
 		return NULL;
 	}
-
+#ifdef CONFIG_PAPP
+  pte->pt_mm = mm;
+#endif /* CONFIG_PAPP */
 	return pte;
 }
 
@@ -99,6 +101,9 @@ static inline pgtable_t pte_alloc_one(struct mm_struct *mm)
 static inline void pte_free(struct mm_struct *mm, struct page *pte_page)
 {
 	pgtable_pte_page_dtor(pte_page);
+#ifdef CONFIG_PAPP
+  pte_page->pt_mm = NULL;
+#endif /* CONFIG_PAPP */
 	__free_page(pte_page);
 }
 

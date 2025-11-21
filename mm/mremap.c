@@ -32,6 +32,10 @@
 
 #include "internal.h"
 
+#ifdef CONFIG_PAPP
+#include <linux/per_app.h>
+#endif /* CONFIG_PAPP */
+
 static pud_t *get_old_pud(struct mm_struct *mm, unsigned long addr)
 {
 	pgd_t *pgd;
@@ -179,7 +183,7 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
 
 	for (; old_addr < old_end; old_pte++, old_addr += PAGE_SIZE,
 				   new_pte++, new_addr += PAGE_SIZE) {
-		if (pte_none(*old_pte))
+    if (pte_none(*old_pte))
 			continue;
 
 		pte = ptep_get_and_clear(mm, old_addr, old_pte);
@@ -199,6 +203,16 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
 		pte = move_pte(pte, new_vma->vm_page_prot, old_addr, new_addr);
 		pte = move_soft_dirty_pte(pte);
 		set_pte_at(mm, new_addr, new_pte, pte);
+#ifdef CONFIG_PAPP
+    if (pte_present(pte)) {
+      struct page *page = pte_page(pte);
+      //struct page *page = vm_normal_page(new_vma, new_addr, pte);
+      if (page && PageAnon(page) && PagePerApp(page)) {
+        // update mapping
+        page_update_rmap_lazy(page, new_pte, new_addr);
+      }
+    }
+#endif /* CONFIG_PAPP */
 	}
 
 	arch_leave_lazy_mmu_mode();

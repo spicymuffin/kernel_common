@@ -77,6 +77,18 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 #endif
 
 #ifndef __HAVE_ARCH_PTEP_CLEAR_YOUNG_FLUSH
+#ifdef CONFIG_PAPP
+int ptep_clear_flush_young_lazy(struct mm_struct *mm,
+        unsigned long address, pte_t *ptep)
+{
+ int young;
+ young = ptep_test_and_clear_young_lazy(mm, address, ptep);
+ if (young)
+   flush_tlb_page_lazy(mm, address);
+ return young;
+}
+#endif /* CONFIG_PAPP */
+
 int ptep_clear_flush_young(struct vm_area_struct *vma,
 			   unsigned long address, pte_t *ptep)
 {
@@ -89,6 +101,18 @@ int ptep_clear_flush_young(struct vm_area_struct *vma,
 #endif
 
 #ifndef __HAVE_ARCH_PTEP_CLEAR_FLUSH
+#ifdef CONFIG_PAPP
+pte_t ptep_clear_flush_lazy(struct mm_struct *mm, unsigned long address,
+    pte_t *ptep)
+{
+ pte_t pte;
+ pte = ptep_get_and_clear(mm, address, ptep);
+ if (pte_accessible(mm, pte))
+   flush_tlb_page_lazy(mm, address);
+ return pte;
+}
+#endif /* CONFIG_PAPP */
+
 pte_t ptep_clear_flush(struct vm_area_struct *vma, unsigned long address,
 		       pte_t *ptep)
 {

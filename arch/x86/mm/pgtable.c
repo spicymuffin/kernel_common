@@ -538,6 +538,18 @@ int pudp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 }
 #endif
 
+#ifdef CONFIG_PAPP
+int ptep_test_and_clear_young_lazy(struct mm_struct *mm,
+    unsigned long addr, pte_t *ptep)
+{
+  int ret = 0;
+  if (pte_young(*ptep))
+    ret = test_and_clear_bit(_PAGE_BIT_ACCESSED, (unsigned long *) &ptep->pte);
+
+ return ret;
+}
+#endif /* CONFIG_PAPP */
+
 int ptep_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pte_t *ptep)
 {
@@ -577,6 +589,14 @@ int pudp_test_and_clear_young(struct vm_area_struct *vma,
 	return ret;
 }
 #endif
+
+#ifdef CONFIG_PAPP
+int ptep_clear_flush_young_lazy(struct mm_struct *mm,
+    unsigned long address, pte_t *ptep)
+{
+  return ptep_test_and_clear_young_lazy(mm, address, ptep);
+}
+#endif /* CONFIG_PAPP */
 
 int ptep_clear_flush_young(struct vm_area_struct *vma,
 			   unsigned long address, pte_t *ptep)

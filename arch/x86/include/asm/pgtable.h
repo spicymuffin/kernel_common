@@ -1046,6 +1046,15 @@ extern int ptep_test_and_clear_young(struct vm_area_struct *vma,
 extern int ptep_clear_flush_young(struct vm_area_struct *vma,
 				  unsigned long address, pte_t *ptep);
 
+#ifdef CONFIG_PAPP
+extern int ptep_test_and_clear_young_lazy(struct mm_struct *mm,
+          unsigned long addr, pte_t *ptep);
+extern int ptep_clear_flush_young_lazy(struct mm_struct *mm,
+             unsigned long address, pte_t *ptep);
+extern pte_t ptep_clear_flush_lazy(struct mm_struct *mm,
+              unsigned long address, pte_t *ptep);
+#endif /* CONFIG_PAPP */
+
 #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
 				       pte_t *ptep)
