@@ -1877,6 +1877,41 @@ void page_add_file_rmap(struct page *page,
 		}
 		if (atomic_inc_and_test(&page->_mapcount))
 			nr++;
+#ifdef CONFIG_PAPP
+    // per-app file page?
+    if (page_mapcount(page) == 1) {
+      // move file page from LRU to app's file page list
+      struct per_app *app = per_app_get_current();
+      struct folio *folio = page_folio(page);
+      if (likely(app && folio_test_lru(folio))) {
+        //folio_del_lru(folio);
+        struct lruvec *lruvec;
+        unsigned long flags;
+        lruvec = folio_lruvec_lock_irqsave(folio, &flags);
+        lruvec_del_folio(lruvec, folio); // list_del() + lruvec size update
+        __folio_clear_lru_flags(folio);
+        unlock_page_lruvec_irqrestore(lruvec, flags);
+        per_app_add_file_page(page, app);
+      }
+    } else if (page_mapcount(page) > 1 && PagePerApp(page)) {
+      // move file page from app's file page list to LRU
+      /*
+      // I maybe need this.. similar in release_pages
+      struct per_app *app = per_app_find_from_page(page);
+      */
+      struct folio *folio = page_folio(page);
+      //folio_lock(folio);
+      list_del_init(&folio->lru);
+      ClearPagePerApp(page);
+      //folio_unlock(folio);
+      if (likely(!folio_test_lru(folio))) {
+        folio_add_lru(folio);
+      } else {
+        // was per-app page, but also was in LRU?
+        BUG();
+      }
+    }
+#endif /* CONFIG_PAPP */
 	}
 out:
 	if (nr)
