@@ -37,7 +37,7 @@
 #include "internal.h"
 #include <trace/hooks/syscall_check.h>
 
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
 #include <linux/per_app.h>
 #endif
 
@@ -936,7 +936,7 @@ static int do_dentry_open(struct file *f,
 			filemap_invalidate_unlock(inode->i_mapping);
 		}
 	}
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
   per_app_instrument_do_dentry_open(f);
 #endif
 	return 0;

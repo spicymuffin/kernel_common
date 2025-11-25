@@ -53,7 +53,7 @@
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/mm.h>
 
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
 #include <linux/per_app.h>
 #endif
 
@@ -986,7 +986,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 {
 	void *shadow = NULL;
 	int ret;
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
   int r;
 #endif
 
@@ -1006,7 +1006,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 		WARN_ON_ONCE(folio_test_active(folio));
 		if (!(gfp & __GFP_WRITE) && shadow)
 			workingset_refault(folio, shadow);
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
     // 0 : moved to perapp
     // 1 : global LRU
     // <0: error
@@ -1027,7 +1027,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 #endif
 		folio_add_lru(folio);
 	}
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
 filemap_add_folio_skip_lru:
 #endif
 	return ret;

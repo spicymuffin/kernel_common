@@ -245,9 +245,11 @@ void per_app_try_to_advance_reclaim_state(struct per_app *app, unsigned long nr_
 void per_app_advance_reclaim_state(struct per_app *app);
 void per_app_print_reclaim_status(struct per_app *app);
 
+#ifdef CONFIG_PAPP_HOME_FILE
 void per_app_instrument_do_dentry_open(struct file *file);
 void per_app_instrument_destroy_inode(struct inode *inode);
 int per_app_instrument_filemap_add_folio(struct address_space *mapping, struct folio *folio);
+#endif
 
 int per_app_manager_init(void);
 void per_app_manager_exit(void);

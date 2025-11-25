@@ -263,6 +263,7 @@ bool per_app_is_target_uid(uid_t uid)
   */
 }
 
+#ifdef CONFIG_PAPP_HOME_FILE
 void per_app_init_home(struct home_entry *home)
 {
   home->home_path_str[0] = '\0';
@@ -365,6 +366,8 @@ int per_app_instrument_filemap_add_folio(struct address_space *mapping, struct f
 
   return 1;
 }
+#endif /* CONFIG_PAPP_HOME_FILE */
+
 
 /*
  * create and initialize per_app struct for given uid
@@ -404,8 +407,9 @@ struct per_app *per_app_create(struct task_struct *task)
 #ifdef CONFIG_PAPP_USE_KREF      
   kref_init(&app->kref); // initial refcount is 1
 #endif
+#ifdef CONFIG_PAPP_HOME_FILE
   per_app_init_home(&app->home);
-
+#endif
   // add this per_app to the head of global app list
   spin_lock(&global_app_manager.app_list_lock);
   

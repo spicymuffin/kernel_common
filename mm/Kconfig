@@ -60,6 +60,13 @@ config TRACK_FILES
   help
     This option tracks all unique files being accessed by an application through UID
 
+config PAPP_HOME_FILE
+  bool "instrument per-app file pages under home path"
+  depends on PAPP
+  default n
+  help
+    This option enables per-app file page instrumentation that are placed under application's home path
+
 menuconfig SWAP
 	bool "Support for paging of anonymous memory (swap)"
 	depends on MMU && BLOCK && !ARCH_NO_SWAP

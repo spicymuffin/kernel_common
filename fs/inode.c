@@ -26,7 +26,7 @@
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/vmscan.h>
 
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
 #include <linux/per_app.h>
 #endif
 
@@ -314,7 +314,7 @@ static void destroy_inode(struct inode *inode)
 
 	BUG_ON(!list_empty(&inode->i_lru));
 
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
   per_app_instrument_destroy_inode(inode);
 #endif
 

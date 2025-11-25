@@ -2373,7 +2373,7 @@ struct super_operations {
 #define S_CASEFOLD	(1 << 15) /* Casefolded file */
 #define S_VERITY	(1 << 16) /* Verity file (using fs/verity/) */
 #define S_KERNEL_FILE	(1 << 17) /* File is in use by the kernel (eg. fs/cachefiles) */
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
 #define S_PERAPP (1 << 18) /* File is in use by the per-app subsystem */
 #endif
 /*
@@ -2420,7 +2420,7 @@ static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags 
 
 #define IS_WHITEOUT(inode)	(S_ISCHR(inode->i_mode) && \
 				 (inode)->i_rdev == WHITEOUT_DEV)
-#ifdef CONFIG_PAPP
+#ifdef CONFIG_PAPP_HOME_FILE
 #define IS_PERAPP(inode) ((inode)->i_flags & S_PERAPP)
 #endif
 
