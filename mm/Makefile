@@ -144,3 +144,4 @@ obj-$(CONFIG_GENERIC_IOREMAP) += ioremap.o
 obj-$(CONFIG_SHRINKER_DEBUG) += shrinker_debug.o
 obj-$(CONFIG_PAPP) += per_app.o
 obj-y += check_memcg.o track_files.o
+obj-y += ksortd.o
