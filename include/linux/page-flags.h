@@ -140,7 +140,10 @@ enum pageflags {
 #endif
 #ifdef CONFIG_PAPP
   	PG_per_app,
-#endif
+#ifdef CONFIG_PAPP_HOT_COLD
+    PG_hot,
+#endif /* CONFIG_PAPP_HOT_COLD */
+#endif /* CONFIG_PAPP */
 #ifdef CONFIG_64BIT
 	PG_oem_reserved_1,
 	PG_oem_reserved_2,
@@ -519,7 +522,14 @@ PAGEFLAG(PerApp, per_app, PF_ANY)
 	__SETPAGEFLAG(PerApp, per_app, PF_ANY)
 	TESTCLEARFLAG(PerApp, per_app, PF_ANY)
 	TESTSETFLAG(PerApp, per_app, PF_ANY)
-#endif
+#ifdef CONFIG_PAPP_HOT_COLD
+PAGEFLAG(Hot, hot, PF_ANY)
+	__CLEARPAGEFLAG(Hot, hot, PF_ANY)
+	__SETPAGEFLAG(Hot, hot, PF_ANY)
+	TESTCLEARFLAG(Hot, hot, PF_ANY)
+	TESTSETFLAG(Hot, hot, PF_ANY)
+#endif /* CONFIG_PAPP_HOT_COLD */
+#endif /* CONFIG_PAPP */
 
 /*
  * Private page markings that may be used by the filesystem that owns the page

@@ -34,6 +34,15 @@ DECLARE_PER_CPU(struct lazy_rmap_stats, lazy_rmap_stats);
 #endif /* CONFIG_PAPP */
 #endif /* CONFIG_MEASURE_RMAP */
 
+#ifdef CONFIG_MEASURE_FAULT 
+#include <linux/percpu.h>
+struct fault_stats {
+  unsigned long long total_cycles;
+  unsigned long long total_count;
+};
+DECLARE_PER_CPU(struct fault_stats, fault_stats);
+#endif /* CONFIG_MEASURE_FAULT */
+
 struct folio_batch;
 
 /*

@@ -77,18 +77,37 @@ struct per_app {
   pid_t pid; // thread group id
   char app_name[PACKAGE_NAME_LEN];
 
+#ifdef CONFIG_PAPP_HOT_COLD
+  // Cold lists - pages accessed once (single-use candidates)
+  struct list_head cold_anon_list;
+  struct list_head cold_file_list;
+  spinlock_t cold_anon_lock;
+  spinlock_t cold_file_lock;
+
+  // Hot lists - pages accessed multiple times
+  struct list_head hot_anon_list;
+  struct list_head hot_file_list;
+  spinlock_t hot_anon_lock;
+  spinlock_t hot_file_lock;
+
+  atomic_long_t nr_cold_anon;
+  atomic_long_t nr_cold_file;
+  atomic_long_t nr_hot_anon;
+  atomic_long_t nr_hot_file;
+#else
   struct list_head page_list; // head of page list
   spinlock_t page_list_lock;  // spinlock for page list
 
   struct list_head file_page_list;
   spinlock_t file_page_list_lock;
+#endif /* CONFIG_PAPP_HOT_COLD */
 
   struct home_entry home;
 
   atomic_long_t nr_pages; // present pages in RAM
   atomic_long_t nr_anon_pages;
   atomic_long_t nr_file_pages;
-  
+
   atomic_long_t nr_reclaimed;
   atomic_long_t nr_anon_reclaimed; // swapped out
   atomic_long_t nr_file_reclaimed;
@@ -234,6 +253,11 @@ int per_app_add_page_vma(struct page *page, struct vm_area_struct *vma, struct p
 void per_app_remove_file_page(struct per_app *app, struct page *page);
 void per_app_remove_page(struct per_app *app, struct page *page);
 void per_app_move_page_to_lru(struct per_app *app, struct page *page, struct vm_area_struct *vma);
+
+#ifdef CONFIG_PAPP_HOT_COLD
+void per_app_promote_page_to_hot(struct page *page, struct per_app *app);
+#endif /* CONFIG_PAPP_HOT_COLD */
+
 struct per_app *per_app_get_current(void);
 unsigned long per_app_get_page_count(struct per_app *app);
 unsigned int per_app_get_app_count(void);
@@ -306,11 +330,13 @@ extern void setup_scan_control_advanced(enum per_app_reclaim_type type,
                                        unsigned long nr_to_reclaim,
                                        bool aggressive, struct mem_cgroup *memcg);
 
-// macros
+#ifndef CONFIG_PAPP_HOT_COLD
+// macros - only valid for non-SINGLE_USED_FAULT (uses page_list)
 #define for_each_app_page(pos, app) \
   list_for_each_entry(pos, &(app)->page_list, lru)
 #define for_each_app_page_safe(pos, tmp, app) \
   list_for_each_entry_safe(pos, tmp, &(app)->page_list, lru)
+#endif /* !CONFIG_PAPP_HOT_COLD */
 
 
 #endif /* _LINUX_PER_APP_H */

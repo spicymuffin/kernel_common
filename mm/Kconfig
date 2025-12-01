@@ -67,6 +67,27 @@ config PAPP_HOME_FILE
   help
     This option enables per-app file page instrumentation that are placed under application's home path
 
+config PAPP_HOT_COLD
+  bool "manage per-app pages that are used once (cold) and used frequently (hot)"
+  depends on PAPP
+  default n
+  help
+    This option manages hot and cold pages separately for each application
+
+config SINGLE_USED_FAULT
+  bool "manage single-used pages by inducing minor faults on second access"
+  depends on PAPP && PAPP_HOT_COLD
+  default n
+  help
+    This option forces minor fault on page's second access to promote page from cold list to hot list
+
+config MEASURE_FAULT
+  bool "Measure second fault overhead"
+  depends on SINGLE_USED_FAULT
+  default n
+  help
+    This option measures overhead of handling second per-app minor fault
+
 menuconfig SWAP
 	bool "Support for paging of anonymous memory (swap)"
 	depends on MMU && BLOCK && !ARCH_NO_SWAP

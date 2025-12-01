@@ -7512,6 +7512,7 @@ clear_reclaim_active(pg_data_t *pgdat, int highest_zoneidx)
 // ------------------------- perapp reclaim logic -------------------------
 #ifdef CONFIG_PAPP
 
+#ifndef CONFIG_PAPP_HOT_COLD
 /*
  * moves folios back to app's page list
  * lock must be held by the caller
@@ -7554,6 +7555,7 @@ static unsigned int per_app_move_folios_to_page_list(struct per_app *app,
 	list_splice(&folios_to_free, list);
 	return nr_moved;
 }
+#endif /* CONFIG_PAPP_HOT_COLD */
 
 /*
  * reclaim pages inside of isolated per_app folio list
@@ -7991,6 +7993,185 @@ keep:
 	return nr_reclaimed;
 }
 
+#ifdef CONFIG_PAPP_HOT_COLD
+/*
+ * Helper function to isolate pages from a specific list
+ * Caller must hold appropriate lock
+ */
+static unsigned long __per_app_isolate_from_list(struct list_head *src,
+						  unsigned long nr_to_scan,
+						  struct list_head *dst,
+						  unsigned long *nr_scanned,
+						  struct scan_control *sc,
+						  const char *list_name)
+{
+	unsigned long nr_taken = 0;
+	unsigned long scan = 0, total_scan = 0;
+	unsigned long nr_pages;
+	LIST_HEAD(folios_skipped);
+
+	while (scan < nr_to_scan && !list_empty(src)) {
+		struct folio *folio;
+		struct list_head *move_to = src;
+
+		folio = lru_to_folio(src);
+		nr_pages = folio_nr_pages(folio);
+		total_scan += nr_pages;
+
+		/* Skip shared pages */
+		if (folio_mapcount(folio) > 1) {
+			goto move;
+		}
+
+		/* Skip pages in wrong zone */
+		if (folio_zonenum(folio) > sc->reclaim_idx) {
+			move_to = &folios_skipped;
+			goto move;
+		}
+
+		scan += nr_pages;
+
+		if (!folio_test_per_app(folio))
+			goto move;
+		if (!sc->may_unmap && folio_mapped(folio))
+			goto move;
+
+		if (unlikely(!folio_try_get(folio)))
+			goto move;
+
+		if (!folio_test_clear_per_app(folio)) {
+			folio_put(folio);
+			goto move;
+		}
+
+		nr_taken += nr_pages;
+		move_to = dst;
+move:
+		list_move(&folio->lru, move_to);
+	}
+
+	/* Put skipped pages back */
+	if (!list_empty(&folios_skipped)) {
+		list_splice(&folios_skipped, src);
+	}
+
+	*nr_scanned += total_scan;
+
+#ifdef CONFIG_DEBUG_PAPP
+	if (nr_taken > 0) {
+		pr_info("  [%s] scanned %lu, taken %lu\n", list_name, scan, nr_taken);
+	}
+#endif
+
+	return nr_taken;
+}
+
+/*
+ * Enumeration for list types to scan in priority order
+ */
+enum per_app_list_type {
+	LIST_COLD_FILE = 0,
+	LIST_COLD_ANON,
+	LIST_HOT_FILE,
+	LIST_HOT_ANON,
+	LIST_TYPE_MAX
+};
+
+/*
+ * Get next list to scan based on what's available
+ * Returns true if a valid list is found, false if all exhausted
+ */
+static bool per_app_get_next_list(struct per_app *app,
+				   enum per_app_list_type *list_type,
+				   struct list_head **list,
+				   spinlock_t **lock,
+				   const char **list_name)
+{
+	while (*list_type < LIST_TYPE_MAX) {
+		switch (*list_type) {
+		case LIST_COLD_FILE:
+			if (atomic_long_read(&app->nr_cold_file) > 0) {
+				*list = &app->cold_file_list;
+				*lock = &app->cold_file_lock;
+				*list_name = "cold_file";
+				return true;
+			}
+			break;
+		case LIST_COLD_ANON:
+			if (atomic_long_read(&app->nr_cold_anon) > 0) {
+				*list = &app->cold_anon_list;
+				*lock = &app->cold_anon_lock;
+				*list_name = "cold_anon";
+				return true;
+			}
+			break;
+		case LIST_HOT_FILE:
+			if (atomic_long_read(&app->nr_hot_file) > 0) {
+				*list = &app->hot_file_list;
+				*lock = &app->hot_file_lock;
+				*list_name = "hot_file";
+				return true;
+			}
+			break;
+		case LIST_HOT_ANON:
+			if (atomic_long_read(&app->nr_hot_anon) > 0) {
+				*list = &app->hot_anon_list;
+				*lock = &app->hot_anon_lock;
+				*list_name = "hot_anon";
+				return true;
+			}
+			break;
+		default:
+			return false;
+		}
+		(*list_type)++;
+	}
+	return false;
+}
+
+/*
+ * Isolate from ONE list at a time
+ * This is called for each isolate->reclaim cycle
+ */
+static unsigned long per_app_isolate_app(struct per_app *app,
+					  unsigned long nr_to_scan,
+					  struct list_head *dst,
+					  unsigned long *nr_scanned,
+					  struct scan_control *sc,
+					  enum per_app_list_type *current_list_type)
+{
+	unsigned long nr_taken = 0;
+	struct list_head *list;
+	spinlock_t *lock;
+	const char *list_name;
+
+	*nr_scanned = 0;
+
+	/* Find next non-empty list starting from current_list_type */
+	if (!per_app_get_next_list(app, current_list_type, &list, &lock, &list_name)) {
+		/* All lists exhausted */
+		return 0;
+	}
+
+	/* Isolate from this list */
+	spin_lock(lock);
+	nr_taken = __per_app_isolate_from_list(list, nr_to_scan, dst,
+					        nr_scanned, sc, list_name);
+	spin_unlock(lock);
+
+#ifdef CONFIG_DEBUG_PAPP
+	pr_info("  [per_app_isolate] Isolated %lu pages from %s\n", nr_taken, list_name);
+#endif
+
+	/* If this list is exhausted, advance to next list for next iteration */
+	if (nr_taken == 0) {
+		(*current_list_type)++;
+	}
+
+	return nr_taken;
+}
+#else /* !CONFIG_PAPP_HOT_COLD */
+
 /*
  * scan pages from target app and isolate them in @dst list
  * app->page_list_lock must be held before calling this function
@@ -8091,7 +8272,9 @@ move:
 #endif
 	return nr_taken;
 }
+#endif /* CONFIG_PAPP_HOT_COLD */
 
+#ifndef CONFIG_PAPP_HOT_COLD
 /*
  * Isolate file pages from per-app file page list for reclaim
  * Similar to per_app_isolate_app() but for file pages from app->file_page_list
@@ -8184,7 +8367,10 @@ move:
 #endif
 	return nr_taken;
 }
+#endif /* CONFIG_PAPP_HOT_COLD */
 
+
+#ifndef CONFIG_PAPP_HOT_COLD
 /*
  * Move folios that couldn't be reclaimed back to file page list
  * Similar to per_app_move_folios_to_page_list() but for file pages
@@ -8231,14 +8417,98 @@ static unsigned int per_app_move_folios_to_file_page_list(struct per_app *app,
 	list_splice(&folios_to_free, list);
 	return nr_moved;
 }
+#endif /* CONFIG_PAPP_HOT_COLD */
 
-#ifdef CONFIG_PAPP_BASELINE_RECLAIM_POLICY
+#ifdef CONFIG_PAPP_HOT_COLD
 /*
- * Per-app BASELINE reclaim with 3-phase file-page priority strategy
- * For each selected app:
- *   Phase 1: Reclaim file pages (clean pages reclaimed, dirty may trigger writeback)
- *   Phase 2: Reclaim anon pages (to swap)
- *   Phase 3: Reclaim file pages again with aggressive writeback
+ * Move folios back to their original cold/hot list based on list_type
+ * For CONFIG_PAPP_HOT_COLD only - pages return to specific cold/hot lists
+ */
+static unsigned int per_app_move_folios_to_cold_hot_list(struct per_app *app,
+							  struct list_head *list,
+							  enum per_app_list_type list_type)
+{
+	int nr_pages, nr_moved = 0;
+	LIST_HEAD(folios_to_free);
+	struct list_head *dest_list;
+	spinlock_t *dest_lock;
+
+	/* Determine destination list based on list_type */
+	switch (list_type) {
+	case LIST_COLD_FILE:
+		dest_list = &app->cold_file_list;
+		dest_lock = &app->cold_file_lock;
+		break;
+	case LIST_COLD_ANON:
+		dest_list = &app->cold_anon_list;
+		dest_lock = &app->cold_anon_lock;
+		break;
+	case LIST_HOT_FILE:
+		dest_list = &app->hot_file_list;
+		dest_lock = &app->hot_file_lock;
+		break;
+	case LIST_HOT_ANON:
+		dest_list = &app->hot_anon_list;
+		dest_lock = &app->hot_anon_lock;
+		break;
+	default:
+		pr_err("[per_app] Invalid list_type %d in move_folios_to_cold_hot_list\n", list_type);
+		return 0;
+	}
+
+	while (!list_empty(list)) {
+		struct folio *folio = lru_to_folio(list);
+		VM_BUG_ON_FOLIO(folio_test_per_app(folio), folio);
+		list_del(&folio->lru);
+
+		if (unlikely(!folio_evictable(folio))) {
+#ifdef CONFIG_DEBUG_PAPP
+			pr_info("[per_app_move_folios_to_cold_hot_list]: UNEVICTABLE\n");
+#endif
+			continue;
+		}
+
+		folio_set_per_app(folio);
+
+		if (unlikely(folio_put_testzero(folio))) {
+			folio_clear_per_app(folio);
+			if (unlikely(folio_test_large(folio))) {
+#ifdef CONFIG_DEBUG_PAPP
+				pr_info("[per_app_move_folios_to_cold_hot_list]: LARGE FOLIO\n");
+#endif
+			} else {
+				list_add(&folio->lru, &folios_to_free);
+			}
+			continue;
+		}
+
+		/* Move back to original cold/hot list */
+		spin_lock(dest_lock);
+		list_add(&folio->lru, dest_list);
+		spin_unlock(dest_lock);
+
+		nr_pages = folio_nr_pages(folio);
+		nr_moved += nr_pages;
+	}
+
+	list_splice(&folios_to_free, list);
+	return nr_moved;
+}
+#endif /* CONFIG_PAPP_HOT_COLD */
+
+/*
+ * Unified per-app reclaim with sequential list-based approach
+ *
+ * With CONFIG_PAPP_HOT_COLD:
+ *   Reclaim order: cold_file → cold_anon → hot_file → hot_anon
+ *   - Isolate from ONE list at a time
+ *   - Reclaim isolated pages
+ *   - Move unreclaimed pages back
+ *   - Repeat for next list or next app
+ *
+ * Without CONFIG_PAPP_HOT_COLD:
+ *   Reclaim order: file_page_list → page_list (anon)
+ *   - Same sequential approach with 2 lists instead of 4
  */
 static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
@@ -8248,12 +8518,7 @@ static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
   enum vm_event_item item;
   struct blk_plug plug;
 
-  /* Simple attempt tracking to prevent infinite loops */
-  unsigned int total_apps = per_app_get_app_count();
-  unsigned int reclaim_attempts = 0;
-  unsigned int max_attempts = total_apps * 4; /* Increased for 3-phase approach */
-
-  // setup scan control
+  // Setup scan control (nr_to_reclaim)
   if (sc->nr_to_reclaim == 0) {
     for (z = 0; z <= sc->reclaim_idx; z++) {
       zone = pgdat->node_zones + z;
@@ -8268,249 +8533,182 @@ static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 
   blk_start_plug(&plug);
 
-  while (sc->nr_reclaimed < sc->nr_to_reclaim && reclaim_attempts < max_attempts) {
-    unsigned long nr_file_pages, nr_anon_pages;
-    unsigned long total_app_reclaimed = 0;
-    unsigned long app_pages_before;
+  /* Outer loop: Keep selecting apps until we've reclaimed enough */
+  while (sc->nr_reclaimed < sc->nr_to_reclaim) {
+#ifdef CONFIG_PAPP_HOT_COLD
+    enum per_app_list_type current_list_type = LIST_COLD_FILE;
+    bool app_exhausted = false;
+#else
+    enum { LIST_FILE = 0, LIST_ANON, LIST_MAX } current_list_type = LIST_FILE;
+    bool app_exhausted = false;
+#endif
+    unsigned long app_reclaimed = 0;  /* Track reclaim for this app */
 
     cond_resched();
 
+    /* Select tail app (LRU app) */
     target_app = per_app_select_app_baseline();
     if (!target_app) {
 #ifdef CONFIG_DEBUG_PAPP
-      pr_info("[PAPP RECLAIM] no app to reclaim\n");
+      pr_info("  [per_app_shrink_node] no app to reclaim\n");
 #endif
       break;
     }
 
 #ifdef CONFIG_DEBUG_PAPP
-    pr_info("[PAPP RECLAIM] === Selected app [%s] PID: %u ===\n",
-            target_app->app_name, target_app->pid);
+    pr_info("  [per_app_shrink_node] target app [%s] PID: %u with %ld pages\n",
+            target_app->app_name, target_app->pid, per_app_get_page_count(target_app));
 #endif
 
-    reclaim_attempts++;
-    app_pages_before = per_app_get_page_count(target_app);
-    nr_file_pages = atomic_long_read(&target_app->nr_file_pages);
-    nr_anon_pages = atomic_long_read(&target_app->nr_anon_pages);
-
-    /* === PHASE 1: Try to reclaim FILE pages first === */
-    if (nr_file_pages > 0 && sc->nr_reclaimed < sc->nr_to_reclaim) {
-      LIST_HEAD(file_folio_list);
-      unsigned long nr_to_scan, nr_scanned = 0, nr_taken = 0, nr_reclaimed = 0;
-      struct reclaim_stat stat;
-      unsigned long remaining = sc->nr_to_reclaim - sc->nr_reclaimed;
-
-      nr_to_scan = min(remaining, nr_file_pages);
-
+    if (!per_app_get_page_count(target_app)) {
 #ifdef CONFIG_DEBUG_PAPP
-      pr_info("[PAPP RECLAIM] PHASE 1: FILE pages - attempting %lu pages\n", nr_to_scan);
+      pr_info("  [per_app_shrink_node] app has 0 pages, continuing\n");
 #endif
-
-      spin_lock(&target_app->file_page_list_lock);
-      nr_taken = per_app_isolate_file_pages(target_app, nr_to_scan, 
-                                             &file_folio_list, &nr_scanned, sc);
-      
-      __mod_node_page_state(pgdat, NR_ISOLATED_FILE, nr_taken);
-      item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
-      if (!cgroup_reclaim(sc))
-        __count_vm_events(item, nr_scanned);
-      __count_vm_events(PGSCAN_FILE, nr_scanned);
-      spin_unlock(&target_app->file_page_list_lock);
-
-      if (nr_taken > 0) {
-        nr_reclaimed = per_app_shrink_app(&file_folio_list, pgdat, sc, &stat);
-
-        spin_lock(&target_app->file_page_list_lock);
-        per_app_move_folios_to_file_page_list(target_app, &file_folio_list);
-
-        __mod_node_page_state(pgdat, NR_ISOLATED_FILE, -nr_taken);
-        item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
-        if (!cgroup_reclaim(sc))
-          __count_vm_events(item, nr_reclaimed);
-        __count_vm_events(PGSTEAL_FILE, nr_reclaimed);
-        spin_unlock(&target_app->file_page_list_lock);
-
-        sc->nr_reclaimed += nr_reclaimed;
-        total_app_reclaimed += nr_reclaimed;
-
-        mem_cgroup_uncharge_list(&file_folio_list);
-        free_unref_page_list(&file_folio_list);
-
-        /* Update stats */
-        sc->nr.dirty += stat.nr_dirty;
-        sc->nr.congested += stat.nr_congested;
-        sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
-        sc->nr.writeback += stat.nr_writeback;
-        sc->nr.immediate += stat.nr_immediate;
-        sc->nr.taken += nr_taken;
-        sc->nr.file_taken += nr_taken;
-
-        atomic_long_sub(nr_reclaimed, &target_app->nr_pages);
-        atomic_long_sub(nr_reclaimed, &target_app->nr_file_pages);
-        atomic_long_add(nr_reclaimed, &target_app->nr_file_reclaimed);
-
-#ifdef CONFIG_DEBUG_PAPP
-        pr_info("[PAPP RECLAIM] PHASE 1: FILE - scanned %lu, taken %lu, reclaimed %lu\n",
-                nr_scanned, nr_taken, nr_reclaimed);
+#ifdef CONFIG_PAPP_USE_KREF
+      per_app_put(target_app);
 #endif
-      }
+      continue;
     }
 
-    /* === PHASE 2: Try to reclaim ANON pages if still need more === */
-    nr_anon_pages = atomic_long_read(&target_app->nr_anon_pages);
-    if (nr_anon_pages > 0 && sc->nr_reclaimed < sc->nr_to_reclaim) {
-      LIST_HEAD(anon_folio_list);
-      unsigned long nr_to_scan, nr_scanned = 0, nr_taken = 0, nr_reclaimed = 0;
+    /* Inner loop: Exhaust this app before moving to next */
+    while (sc->nr_reclaimed < sc->nr_to_reclaim && !app_exhausted) {
+      LIST_HEAD(folio_list);
+      unsigned long nr_to_scan, nr_taken = 0, nr_scanned = 0, nr_reclaimed;
       struct reclaim_stat stat;
-      unsigned long remaining = sc->nr_to_reclaim - sc->nr_reclaimed;
+      unsigned long remaining_to_reclaim;
+      bool is_file = false;
 
-      nr_to_scan = min(remaining, nr_anon_pages);
+      remaining_to_reclaim = sc->nr_to_reclaim - sc->nr_reclaimed;
+      nr_to_scan = min(remaining_to_reclaim, (unsigned long)SWAP_CLUSTER_MAX);
 
-#ifdef CONFIG_DEBUG_PAPP
-      pr_info("[PAPP RECLAIM] PHASE 2: ANON pages - attempting %lu pages\n", nr_to_scan);
-#endif
-
-      spin_lock(&target_app->page_list_lock);
+#ifdef CONFIG_PAPP_HOT_COLD
+      /* Isolate from current list (cold_file → cold_anon → hot_file → hot_anon) */
       nr_taken = per_app_isolate_app(target_app, nr_to_scan,
-                                      &anon_folio_list, &nr_scanned, sc);
+                                       &folio_list, &nr_scanned, sc,
+                                       &current_list_type);
 
-      __mod_node_page_state(pgdat, NR_ISOLATED_ANON, nr_taken);
+      if (!nr_taken) {
+        if (current_list_type >= LIST_TYPE_MAX) {
+          app_exhausted = true;
+#ifdef CONFIG_DEBUG_PAPP
+          pr_info("  [per_app_shrink_node] app exhausted\n");
+#endif
+          break;
+        }
+        continue; /* Try next list */
+      }
+
+      /* Determine if this is file or anon based on list type */
+      is_file = (current_list_type == LIST_COLD_FILE || current_list_type == LIST_HOT_FILE);
+
+#else /* !CONFIG_PAPP_HOT_COLD */
+      /* Isolate from file_page_list or page_list (anon) sequentially */
+      if (current_list_type == LIST_FILE) {
+        unsigned long nr_file_pages = atomic_long_read(&target_app->nr_file_pages);
+        if (nr_file_pages > 0) {
+          spin_lock(&target_app->file_page_list_lock);
+          nr_taken = per_app_isolate_file_pages(target_app, nr_to_scan,
+                                                  &folio_list, &nr_scanned, sc);
+          spin_unlock(&target_app->file_page_list_lock);
+          is_file = true;
+        }
+        if (!nr_taken) {
+          current_list_type = LIST_ANON; /* Move to anon list */
+          continue;
+        }
+      } else if (current_list_type == LIST_ANON) {
+        unsigned long nr_anon_pages = atomic_long_read(&target_app->nr_anon_pages);
+        if (nr_anon_pages > 0) {
+          spin_lock(&target_app->page_list_lock);
+          nr_taken = per_app_isolate_app(target_app, nr_to_scan,
+                                           &folio_list, &nr_scanned, sc);
+          spin_unlock(&target_app->page_list_lock);
+          is_file = false;
+        }
+        if (!nr_taken) {
+          current_list_type = LIST_MAX; /* All lists exhausted */
+          app_exhausted = true;
+          break;
+        }
+      } else {
+        /* Both lists exhausted */
+        app_exhausted = true;
+        break;
+      }
+#endif /* CONFIG_PAPP_HOT_COLD */
+
+      /* Update node stats before reclaim */
+      __mod_node_page_state(pgdat, is_file ? NR_ISOLATED_FILE : NR_ISOLATED_ANON, nr_taken);
       item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
       if (!cgroup_reclaim(sc))
         __count_vm_events(item, nr_scanned);
-      __count_vm_events(PGSCAN_ANON, nr_scanned);
-      spin_unlock(&target_app->page_list_lock);
+      __count_vm_events(is_file ? PGSCAN_FILE : PGSCAN_ANON, nr_scanned);
 
-      if (nr_taken > 0) {
-        nr_reclaimed = per_app_shrink_app(&anon_folio_list, pgdat, sc, &stat);
+      /* Reclaim isolated pages */
+      nr_reclaimed = per_app_shrink_app(&folio_list, pgdat, sc, &stat);
 
+      /* Move unreclaimed pages back to appropriate list */
+#ifdef CONFIG_PAPP_HOT_COLD
+      /* For SINGLE_USED_FAULT, folios return to their original cold/hot lists */
+      per_app_move_folios_to_cold_hot_list(target_app, &folio_list, current_list_type);
+#else
+      /* For non-SINGLE_USED_FAULT, folios return to page_list or file_page_list */
+      if (is_file) {
+        spin_lock(&target_app->file_page_list_lock);
+        per_app_move_folios_to_file_page_list(target_app, &folio_list);
+        spin_unlock(&target_app->file_page_list_lock);
+      } else {
         spin_lock(&target_app->page_list_lock);
-        per_app_move_folios_to_page_list(target_app, &anon_folio_list);
-
-        __mod_node_page_state(pgdat, NR_ISOLATED_ANON, -nr_taken);
-        item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
-        if (!cgroup_reclaim(sc))
-          __count_vm_events(item, nr_reclaimed);
-        __count_vm_events(PGSTEAL_ANON, nr_reclaimed);
+        per_app_move_folios_to_page_list(target_app, &folio_list);
         spin_unlock(&target_app->page_list_lock);
+      }
+#endif
 
-        sc->nr_reclaimed += nr_reclaimed;
-        total_app_reclaimed += nr_reclaimed;
+      /* Update node stats after reclaim */
+      __mod_node_page_state(pgdat, is_file ? NR_ISOLATED_FILE : NR_ISOLATED_ANON, -nr_taken);
+      item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+      if (!cgroup_reclaim(sc))
+        __count_vm_events(item, nr_reclaimed);
+      __count_vm_events(is_file ? PGSTEAL_FILE : PGSTEAL_ANON, nr_reclaimed);
 
-        mem_cgroup_uncharge_list(&anon_folio_list);
-        free_unref_page_list(&anon_folio_list);
+      /* Update scan_control stats */
+      sc->nr_reclaimed += nr_reclaimed;
+      app_reclaimed += nr_reclaimed;  /* Track app-specific reclaim */
+      sc->nr.dirty += stat.nr_dirty;
+      sc->nr.congested += stat.nr_congested;
+      sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
+      sc->nr.writeback += stat.nr_writeback;
+      sc->nr.immediate += stat.nr_immediate;
+      sc->nr.taken += nr_taken;
+      if (is_file)
+        sc->nr.file_taken += nr_taken;
 
-        /* Handle writeback throttling if needed */
-        if (stat.nr_unqueued_dirty == nr_taken) {
-          wakeup_flusher_threads(WB_REASON_VMSCAN);
-          if (!writeback_throttling_sane(sc))
-            reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
-        }
-
-        /* Update stats */
-        sc->nr.dirty += stat.nr_dirty;
-        sc->nr.congested += stat.nr_congested;
-        sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
-        sc->nr.writeback += stat.nr_writeback;
-        sc->nr.immediate += stat.nr_immediate;
-        sc->nr.taken += nr_taken;
-
-        atomic_long_sub(nr_reclaimed, &target_app->nr_pages);
+      /* Update per-app stats */
+      atomic_long_sub(nr_reclaimed, &target_app->nr_pages);
+      if (is_file) {
+        atomic_long_sub(nr_reclaimed, &target_app->nr_file_pages);
+        atomic_long_add(nr_reclaimed, &target_app->nr_file_reclaimed);
+      } else {
         atomic_long_sub(nr_reclaimed, &target_app->nr_anon_pages);
         atomic_long_add(nr_reclaimed, &target_app->nr_anon_reclaimed);
-
-#ifdef CONFIG_DEBUG_PAPP
-        pr_info("[PAPP RECLAIM] PHASE 2: ANON - scanned %lu, taken %lu, reclaimed %lu\n",
-                nr_scanned, nr_taken, nr_reclaimed);
-#endif
       }
-    }
 
-    /* === PHASE 3: Try FILE pages again with more aggressive writeback === */
-    nr_file_pages = atomic_long_read(&target_app->nr_file_pages);
-    if (nr_file_pages > 0 && sc->nr_reclaimed < sc->nr_to_reclaim) {
-      LIST_HEAD(file_folio_list);
-      unsigned long nr_to_scan, nr_scanned = 0, nr_taken = 0, nr_reclaimed = 0;
-      struct reclaim_stat stat;
-      unsigned long remaining = sc->nr_to_reclaim - sc->nr_reclaimed;
-
-      nr_to_scan = min(remaining, nr_file_pages);
+      /* Free reclaimed pages */
+      mem_cgroup_uncharge_list(&folio_list);
+      free_unref_page_list(&folio_list);
 
 #ifdef CONFIG_DEBUG_PAPP
-      pr_info("[PAPP RECLAIM] PHASE 3: FILE (aggressive) - attempting %lu pages\n", nr_to_scan);
+      pr_info("  [per_app_shrink_node] reclaimed %lu pages from %s list\n",
+              nr_reclaimed, is_file ? "file" : "anon");
 #endif
-
-      spin_lock(&target_app->file_page_list_lock);
-      nr_taken = per_app_isolate_file_pages(target_app, nr_to_scan,
-                                             &file_folio_list, &nr_scanned, sc);
-
-      __mod_node_page_state(pgdat, NR_ISOLATED_FILE, nr_taken);
-      item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
-      if (!cgroup_reclaim(sc))
-        __count_vm_events(item, nr_scanned);
-      __count_vm_events(PGSCAN_FILE, nr_scanned);
-      spin_unlock(&target_app->file_page_list_lock);
-
-      if (nr_taken > 0) {
-        nr_reclaimed = per_app_shrink_app(&file_folio_list, pgdat, sc, &stat);
-
-        spin_lock(&target_app->file_page_list_lock);
-        per_app_move_folios_to_file_page_list(target_app, &file_folio_list);
-
-        __mod_node_page_state(pgdat, NR_ISOLATED_FILE, -nr_taken);
-        item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
-        if (!cgroup_reclaim(sc))
-          __count_vm_events(item, nr_reclaimed);
-        __count_vm_events(PGSTEAL_FILE, nr_reclaimed);
-        spin_unlock(&target_app->file_page_list_lock);
-
-        sc->nr_reclaimed += nr_reclaimed;
-        total_app_reclaimed += nr_reclaimed;
-
-        mem_cgroup_uncharge_list(&file_folio_list);
-        free_unref_page_list(&file_folio_list);
-
-        /* Handle writeback - more aggressive in phase 3 */
-        if (stat.nr_unqueued_dirty > 0 || stat.nr_writeback > 0) {
-          wakeup_flusher_threads(WB_REASON_VMSCAN);
-          if (!writeback_throttling_sane(sc))
-            reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
-        }
-
-        /* Update stats */
-        sc->nr.dirty += stat.nr_dirty;
-        sc->nr.congested += stat.nr_congested;
-        sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
-        sc->nr.writeback += stat.nr_writeback;
-        sc->nr.immediate += stat.nr_immediate;
-        sc->nr.taken += nr_taken;
-        sc->nr.file_taken += nr_taken;
-
-        atomic_long_sub(nr_reclaimed, &target_app->nr_pages);
-        atomic_long_sub(nr_reclaimed, &target_app->nr_file_pages);
-        atomic_long_add(nr_reclaimed, &target_app->nr_file_reclaimed);
-
-#ifdef CONFIG_DEBUG_PAPP
-        pr_info("[PAPP RECLAIM] PHASE 3: FILE (aggressive) - scanned %lu, taken %lu, reclaimed %lu\n",
-                nr_scanned, nr_taken, nr_reclaimed);
-#endif
-      }
     }
-
-    /* Sanity check */
-    if (unlikely(per_app_get_page_count(target_app) < 0UL)) {
-      pr_warn("per_app %s has negative page count\n", target_app->app_name);
-      //BUG();
-    }
-
-#ifdef CONFIG_DEBUG_PAPP
-    pr_info("[PAPP RECLAIM SESSION] App: [%s] PID: %u | Before: %lu pages | Total Reclaimed: %lu | Remaining: %lu pages\n",
-            target_app->app_name, target_app->pid, app_pages_before,
-            total_app_reclaimed, per_app_get_page_count(target_app));
-#endif
 
     /* Update global reclaimed count for this app */
-    atomic_long_add(total_app_reclaimed, &target_app->nr_reclaimed);
+    atomic_long_add(app_reclaimed, &target_app->nr_reclaimed);
+
+#ifdef CONFIG_PAPP_USE_KREF
+    per_app_put(target_app);
+#endif
   }
 
   blk_finish_plug(&plug);
@@ -8518,8 +8716,8 @@ static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
   per_app_reset_reclaimed();
 
 #ifdef CONFIG_DEBUG_PAPP
-  pr_info("[PAPP RECLAIM] nr_to_reclaim: %lu\t nr_scanned: %lu\t nr_reclaimed: %lu\t attempts: %d\n",
-          sc->nr_to_reclaim, sc->nr_scanned, sc->nr_reclaimed, reclaim_attempts);
+  pr_info("  [per_app_shrink_node] TOTAL nr_to_reclaim: %lu, nr_scanned: %lu, nr_reclaimed: %lu\n",
+          sc->nr_to_reclaim, sc->nr_scanned, sc->nr_reclaimed);
 #endif
 
   trace_per_app_reclaim_stat(sc->nr_to_reclaim, sc->nr_scanned, sc->nr_reclaimed);
@@ -8527,217 +8725,6 @@ static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
   /* Return true if we reclaimed enough pages */
   return sc->nr_reclaimed >= sc->nr_to_reclaim;
 }
-
-#else
-
-/*
- * per-app version of shrink_node (node is kinda irrelevant I guess..)
- * sets up scan_control and start reclaiming app's pages
- * returns true if kswapd scanned at least the request number of pages to reclaim
- * if not, continue with the default reclaim
- */
-static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc)
-{
-  unsigned long nr_reclaimed, nr_scanned, nr_taken;
-  struct zone *zone;
-  int z;
-  struct per_app *target_app;
-  //bool skip;
-  enum vm_event_item item;
-  struct blk_plug plug;
-
-  // set up scan control (nr_to_reclaim, nr_reclaimed, nr_scanned, etc)
-
-  // per_app_shrink_node may called from different context (e.g. force reclaim)
-  // and sc->nr_to_reclaim may not be zero. In that case, respect the sc->nr_to_reclaim.
-  if (sc->nr_to_reclaim == 0) {
-    for (z = 0; z <= sc->reclaim_idx; z++) {
-      zone = pgdat->node_zones + z;
-      if (!managed_zone(zone))
-        continue;
-      //sc->nr_to_reclaim += max(high_wmark_pages(zone), APP_CLUSTER_MAX);
-      sc->nr_to_reclaim += max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
-    }
-  }
-
-  sc->nr_reclaimed = 0;
-  sc->nr_scanned = 0;
-
-  blk_start_plug(&plug);
-
-  while (sc->nr_reclaimed < sc->nr_to_reclaim) {
-    LIST_HEAD(folio_list);
-    unsigned long nr_to_scan;
-    long nr_pages;
-    struct reclaim_stat stat;
-    bool file = false; // TODO: per-app pages should consider BOTH anon and file
-    unsigned long remaining_to_reclaim;
-    //unsigned long nr_file_reclaimed = 0;
-
-    cond_resched();
-    target_app = per_app_select_app();
-    if (!target_app) {
-#ifdef CONFIG_DEBUG_PAPP
-      pr_info("  [per_app_shrink_node] there is no app to reclaim: break\n");
-#endif
-      break;
-    }
-#ifdef CONFIG_DEBUG_PAPP
-    per_app_print_reclaim_status(target_app);
-#endif
-
-    nr_pages = per_app_get_page_count(target_app);
-
-#ifdef CONFIG_DEBUG_PAPP
-    pr_info("  [per_app_shrink_node] target app uid <%u> with %ld pages\n",
-        from_kuid(&init_user_ns, target_app->uid), nr_pages);
-#endif
-
-    if (!nr_pages) {
-#ifdef CONFIG_DEBUG_PAPP
-      pr_info("  [per_app_shrink_node]: this app has 0 page: continue\n");
-#endif
-      /* this app has no pages to reclaim */
-      per_app_advance_reclaim_state(target_app);
-#ifdef CONFIG_PAPP_USE_KREF
-      per_app_put(target_app);
-#endif
-    continue;
-    }
-
-    /*
-     * custom skip policy
-    trace_android_vh_shrink_node_per_app(app, &skip);
-    if (skip)
-      continue;
-    */
-
-    nr_to_scan = per_app_calculate_nr_to_scan(target_app);
-    if (!nr_to_scan) {
-#ifdef CONFIG_DEBUG_PAPP
-      pr_info("  [per_app_shrink_node]: 0 page to scan from this app: continue\n");
-#endif
-      /* not enough pages to reclaim */
-      per_app_advance_reclaim_state(target_app);
-#ifdef CONFIG_PAPP_USE_KREF
-      per_app_put(target_app);
-#endif
-      continue;
-    }
-
-    /* Limit nr_to_scan to respect the total reclaim target */
-    remaining_to_reclaim = max(sc->nr_to_reclaim - sc->nr_reclaimed, 0UL);
-    if (remaining_to_reclaim > 0UL) {
-      nr_to_scan = min(nr_to_scan, remaining_to_reclaim);
-    }
-
-    spin_lock(&target_app->page_list_lock);
-    nr_taken = per_app_isolate_app(target_app, nr_to_scan,
-        &folio_list, &nr_scanned, sc);
-
-    // TODO: we may need a new node_stat_item like NR_ISOLATED_PER_APP 
-    __mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
-    item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
-    if (!cgroup_reclaim(sc))
-      __count_vm_events(item, nr_scanned);
-    //__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
-    __count_vm_events(PGSCAN_ANON + file, nr_scanned);
-
-    spin_unlock(&target_app->page_list_lock);
-    if (!nr_taken) {
-#ifdef CONFIG_DEBUG_PAPP
-      pr_info("  [per_app_shrink_node]: 0 page taken from this app: continue\n");
-#endif
-      /* failed to isolate any page from this app */
-      per_app_advance_reclaim_state(target_app);
-#ifdef CONFIG_PAPP_USE_KREF
-      per_app_put(target_app);
-#endif
-
-      continue;
-    }
-
-    //nr_reclaimed = per_app_shrink_app(&folio_list, pgdat, sc, &stat, &nr_file_reclaimed);
-    nr_reclaimed = per_app_shrink_app(&folio_list, pgdat, sc, &stat);
-
-    spin_lock(&target_app->page_list_lock);
-    per_app_move_folios_to_page_list(target_app, &folio_list);
-
-    item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
-    if (!cgroup_reclaim(sc))
-      __count_vm_events(item, nr_reclaimed);
-    //__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
-    __count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
-    spin_unlock(&target_app->page_list_lock);
-
-    // UPDATING SCAN_CONTROL VALUES
-    sc->nr_reclaimed += nr_reclaimed; // this is originally done inside shrink_lruvec()
-    /* updating target app reclaim state and account for reclaimed pages */
-    per_app_try_to_advance_reclaim_state(target_app, nr_reclaimed);
-
-    //atomic_long_add(nr_file_reclaimed, &target_app->nr_file_reclaimed);
-    //atomic_long_add(nr_reclaimed - nr_file_reclaimed, &target_app->nr_anon_reclaimed);
-
-    //lru_note_cost(lruvec, file, stat.nr_pageout);
-    mem_cgroup_uncharge_list(&folio_list);
-    free_unref_page_list(&folio_list);
-
-    if (stat.nr_unqueued_dirty == nr_taken) {
-      wakeup_flusher_threads(WB_REASON_VMSCAN);
-      if (!writeback_throttling_sane(sc))
-        reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
-    }
-    sc->nr.dirty += stat.nr_dirty;
-    sc->nr.congested += stat.nr_congested;
-    sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
-    sc->nr.writeback += stat.nr_writeback;
-    sc->nr.immediate += stat.nr_immediate;
-    sc->nr.taken += nr_taken;
-    if (file) // TODO: again, we reclaimed a mix of anon and file per-app pages..
-      sc->nr.file_taken += nr_taken;
-
-#ifdef CONFIG_PAPP_USE_KREF
-    // if app was selected, we must have a matching put for per_app_select_app()
-    per_app_put(target_app);
-#endif
-#ifdef CONFIG_DEBUG_PAPP
-    pr_info("  [per_app_shrink_node] reclaimed %lu pages from this app\n", nr_reclaimed);
-#endif
-
-    /* we failed to reclaim any page, advance reclaim state to prevent infinite loop */
-    if (!nr_reclaimed) {
-#ifdef CONFIG_DEBUG_PAPP
-      pr_info("  [per_app_shrink_node] failed to reclaim any page: advance state and continue\n");
-#endif
-      /* Advance reclaim state to prevent infinite loop on this app */
-      per_app_advance_reclaim_state(target_app);
-      continue;  /* Try next app instead of breaking */
-    }
-  }
-
-  blk_finish_plug(&plug);
-
-  /*
-   * TODO: where to call shrink_slab()? 
-  pr_info("  About to call shrink_slab\nGFP: %pGg\tNode id: %d\t NULL: %d\tPriority: %d\n",
-      &sc->gfp_mask, pgdat->node_id, sc->target_mem_cgroup ? 1 : 0, sc->priority);
-  shrink_slab(sc->gfp_mask, pgdat->node_id, sc->target_mem_cgroup, sc->priority);
-  pr_info("  shrink_slab done\n");
-  */
-
-#ifdef CONFIG_DEBUG_PAPP
-  pr_info("  [per_app_shrink_node]: TOTAL nr_to_reclaim: %lu\t nr_scanned: %lu\t nr_reclaimed: %lu\n",
-      sc->nr_to_reclaim, sc->nr_scanned, sc->nr_reclaimed);
-#endif
-  pr_info("  [per_app_shrink_node]: TOTAL nr_to_reclaim: %lu\t nr_scanned: %lu\t nr_reclaimed: %lu\n",
-      sc->nr_to_reclaim, sc->nr_scanned, sc->nr_reclaimed);
-
-//out:
-  trace_per_app_shrink_node(sc->nr_to_reclaim, sc->nr_scanned, sc->nr_reclaimed);
-  return sc->nr_scanned >= sc->nr_to_reclaim;
-}
-
-#endif /* CONFIG_PAPP_BASELINE_RECLAIM_POLICY */
 
 #endif /* CONFIG_PAPP */
 // ------------------------- end of perapp reclaim ------------------------

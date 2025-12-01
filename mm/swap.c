@@ -1070,22 +1070,21 @@ void release_pages(struct page **pages, int nr)
         // and if they are per-app managed, it reaches here.
 
         // there are 2 options:
-        // 1) don't free them -> this will result in unresolved memory pressure
-        // 2) just call list_del() -> this will result in incorrect accounting, since we cannot
+        // 1) just call list_del() -> this will result in incorrect accounting, since we cannot
         // find the corresponding per_app and update its nr_pages
+        // 2) don't free them -> this will result in unresolved memory pressure
 
-        // for now, I think option 2 is more safe (but may waste CPU cycles during reclaim.. :(
-
-        folio_lock(folio);
+        // for now, I think option 1 is more safe (but may waste CPU cycles during reclaim.. :(
+        
+        // V1: just delete the folio
         /*
-        if (unlikely(folio_test_anon(folio))) {
-          pr_warn("[release_pages] anon page being released without per_app?\n");
-        }
-        */
+        folio_lock(folio);
         list_del_init(&folio->lru);
         ClearPagePerApp(&folio->page);
         folio_unlock(folio);
-			}
+        */
+        // V2: just skip for now..
+      }
 		}
 check_lru:
 #endif

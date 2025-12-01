@@ -111,6 +111,47 @@
 #endif
 
 #ifdef CONFIG_PAPP
+
+#ifdef CONFIG_PAPP_HOT_COLD
+
+#define __def_pageflag_names						\
+	{1UL << PG_locked,		"locked"	},		\
+	{1UL << PG_waiters,		"waiters"	},		\
+	{1UL << PG_error,		"error"		},		\
+	{1UL << PG_referenced,		"referenced"	},		\
+	{1UL << PG_uptodate,		"uptodate"	},		\
+	{1UL << PG_dirty,		"dirty"		},		\
+	{1UL << PG_lru,			"lru"		},		\
+	{1UL << PG_active,		"active"	},		\
+	{1UL << PG_workingset,		"workingset"	},		\
+	{1UL << PG_slab,		"slab"		},		\
+	{1UL << PG_owner_priv_1,	"owner_priv_1"	},		\
+	{1UL << PG_arch_1,		"arch_1"	},		\
+	{1UL << PG_reserved,		"reserved"	},		\
+	{1UL << PG_private,		"private"	},		\
+	{1UL << PG_private_2,		"private_2"	},		\
+	{1UL << PG_writeback,		"writeback"	},		\
+	{1UL << PG_head,		"head"		},		\
+	{1UL << PG_mappedtodisk,	"mappedtodisk"	},		\
+	{1UL << PG_reclaim,		"reclaim"	},		\
+	{1UL << PG_swapbacked,		"swapbacked"	},		\
+	{1UL << PG_unevictable,		"unevictable"	},		\
+	{1UL << PG_per_app,		"per_app"	},		\
+	{1UL << PG_hot,		"hot"	}		\
+IF_HAVE_PG_MLOCK(PG_mlocked,		"mlocked"	)		\
+IF_HAVE_PG_UNCACHED(PG_uncached,	"uncached"	)		\
+IF_HAVE_PG_HWPOISON(PG_hwpoison,	"hwpoison"	)		\
+IF_HAVE_PG_IDLE(PG_young,		"young"		)		\
+IF_HAVE_PG_IDLE(PG_idle,		"idle"		)		\
+IF_HAVE_PG_ARCH_2(PG_arch_2,		"arch_2"	)		\
+IF_HAVE_PG_OEM_RESERVED(oem_reserved_1)                    \
+IF_HAVE_PG_OEM_RESERVED(oem_reserved_2)                    \
+IF_HAVE_PG_OEM_RESERVED(oem_reserved_3)                    \
+IF_HAVE_PG_OEM_RESERVED(oem_reserved_4)                    \
+IF_HAVE_PG_SKIP_KASAN_POISON(PG_skip_kasan_poison, "skip_kasan_poison")
+
+#else /* CONFIG_PAPP_HOT_COLD */
+
 #define __def_pageflag_names						\
 	{1UL << PG_locked,		"locked"	},		\
 	{1UL << PG_waiters,		"waiters"	},		\
@@ -146,7 +187,9 @@ IF_HAVE_PG_OEM_RESERVED(oem_reserved_3)                    \
 IF_HAVE_PG_OEM_RESERVED(oem_reserved_4)                    \
 IF_HAVE_PG_SKIP_KASAN_POISON(PG_skip_kasan_poison, "skip_kasan_poison")
 
-#else
+#endif /* CONFIG_PAPP_HOT_COLD */
+
+#else /* CONFIG_PAPP */
 
 #define __def_pageflag_names						\
 	{1UL << PG_locked,		"locked"	},		\

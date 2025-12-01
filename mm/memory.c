@@ -102,6 +102,73 @@
 #include <linux/per_app.h>
 #endif
 
+#ifdef CONFIG_MEASURE_FAULT
+#include <asm/msr.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+
+DEFINE_PER_CPU(struct fault_stats, fault_stats);
+#define FAULT_STATS_START() unsigned long long __fault_start = rdtsc_ordered()
+#define FAULT_STATS_END(stats_var) \
+  do { \
+    unsigned long long __fault_duration = rdtsc_ordered() - __fault_start; \
+    this_cpu_add(stats_var.total_cycles, __fault_duration); \
+    this_cpu_inc(stats_var.total_count); \
+  } while (0)
+
+// proc fs for fault stats
+static int fault_stats_show(struct seq_file *m, void *v)
+{
+  unsigned long long total_cycles = 0, total_count = 0;
+  unsigned long long avg_cycles = 0;
+  int cpu;
+
+  /* Aggregate fault stats from all CPUs */
+  for_each_possible_cpu(cpu) {
+    struct fault_stats *stats = per_cpu_ptr(&fault_stats, cpu);
+    total_cycles += stats->total_cycles;
+    total_count += stats->total_count;
+  }
+
+  if (total_count > 0)
+    avg_cycles = total_cycles / total_count;
+
+  seq_printf(m, "Second Fault Handling Statistics:\n");
+  seq_printf(m, "  total faults:        %llu\n", total_count);
+  seq_printf(m, "  total cycles:      %llu\n", total_cycles);
+  seq_printf(m, "  average cycles:        %llu\n", avg_cycles);
+
+  return 0;
+}
+
+static int fault_stats_open(struct inode *inode, struct file *file)
+{
+  return single_open(file, fault_stats_show, NULL);
+}
+
+static const struct proc_ops fault_stats_proc_ops = {
+  .proc_open  = fault_stats_open,
+  .proc_read  = seq_read,
+  .proc_lseek = seq_lseek,
+  .proc_release = single_release,
+};
+
+static int __init fault_stats_init(void)
+{
+  proc_create("fault_stats", 0444, NULL, &fault_stats_proc_ops);
+  return 0;
+}
+late_initcall(fault_stats_init);
+
+
+
+#else
+
+#define FAULT_STATS_START() do { } while (0)
+#define FAULT_STATS_END(stats_var) do { } while (0)
+
+#endif /* CONFIG_MEASURE_FAULT */
+
 #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
 #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
 #endif
@@ -4291,6 +4358,10 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	struct per_app *app;
 #endif
 
+#ifdef CONFIG_SINGLE_USED_FAULT
+  bool update_pte = false;
+#endif
+
 	/* File mapping without ->vm_ops ? */
 	if (vma->vm_flags & VM_SHARED)
 		return VM_FAULT_SIGBUS;
@@ -4393,13 +4464,31 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 #ifdef CONFIG_PAPP_USE_KREF
 		per_app_put(app);
 #endif
-		goto setpte;
+#ifdef CONFIG_SINGLE_USED_FAULT
+    update_pte = true;
+#endif /* CONFIG_SINGLE_USED_FAULT */
+    goto setpte;
 	}
 #endif /* CONFIG_PAPP */
 	page_add_new_anon_rmap(page, vma, vmf->address);
 	lru_cache_add_inactive_or_unevictable(page, vma);
 setpte:
 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+#ifdef CONFIG_SINGLE_USED_FAULT
+  /* Set PTE to PROT_NONE to force second fault on next access */
+  if (update_pte) {
+    //READ_ONCE(*(char *)vmf->address);
+    char dummy;
+    pagefault_disable();
+    __get_user(dummy, (char __user *)vmf->address);
+    pagefault_enable();
+
+    entry = pte_modify(entry, PAGE_NONE);
+    set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+    pr_info_once("[TID %d] [do_anon] Setting PTE to PROT_NONE for page %p at addr 0x%lx, pte flags: 0x%lx\n",
+            current->pid, page, vmf->address, pte_val(entry));
+  }
+#endif /* CONFIG_SINGLE_USED_FAULT */
 
 	/* No need to invalidate - it was non-present before */
 	update_mmu_cache(vma, vmf->address, vmf->pte);
@@ -4592,7 +4681,22 @@ void do_set_pte(struct vm_fault *vmf, struct page *page, unsigned long addr)
 		inc_mm_counter_fast(vma->vm_mm, mm_counter_file(page));
 		page_add_file_rmap(page, vma, false);
 	}
-	set_pte_at(vma->vm_mm, addr, vmf->pte, entry);
+
+  set_pte_at(vma->vm_mm, addr, vmf->pte, entry);
+#ifdef CONFIG_SINGLE_USED_FAULT
+  if (PagePerApp(page)) {
+    //READ_ONCE(*(char *)addr);
+    char dummy;
+    pagefault_disable();
+    __get_user(dummy, (char __user *)addr);
+    pagefault_enable();
+
+    entry = pte_modify(entry, PAGE_NONE);
+    set_pte_at(vma->vm_mm, addr, vmf->pte, entry);
+    pr_info_once("[TID %d] [do_set_pte] Setting PTE to PROT_NONE for new page %p at addr 0x%lx\n",
+            current->pid, page, vmf->address);
+  }
+#endif /* CONFIG_SINGLE_USED_FAULT */
 }
 
 static bool vmf_pte_changed(struct vm_fault *vmf)
@@ -5081,6 +5185,77 @@ out_map:
 	return 0;
 }
 
+#ifdef CONFIG_SINGLE_USED_FAULT
+// handle minor fault on per-app page's second access
+static vm_fault_t do_per_app_page(struct vm_fault *vmf)
+{
+  struct vm_area_struct *vma = vmf->vma;
+  struct page *page = NULL;
+  struct per_app *app;
+  pte_t pte, old_pte;
+  bool was_writable = pte_savedwrite(vmf->orig_pte);
+
+  // acquire the page table lock first
+  vmf->ptl = pte_lockptr(vma->vm_mm, vmf->pmd);
+  spin_lock(vmf->ptl);
+
+  // validate PTE hasn't changed
+  if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+    pr_info_once("[TID %d] [second_fault] PTE changed, aborting. page %p at addr 0x%lx\n",
+      current->pid, page, vmf->address);
+    return 0;
+	}
+
+  // restore PTE
+  old_pte = ptep_get(vmf->pte);
+  pte = pte_modify(old_pte, vma->vm_page_prot);
+
+  page = vm_normal_page(vma, vmf->address, pte);
+  if (!page) {
+    pr_info_once("[TID %d] [second_fault] page is NULL. aborting.\n", current->pid);
+    goto out_map;
+  }
+  
+  // if not per-app, it must be NUMA fault
+  if (!PagePerApp(page)) {
+    pr_info_once("[TID %d] [second_fault] page is not per-app. page %p at addr 0x%lx\n",
+      current->pid, page, vmf->address);
+    pte_unmap_unlock(vmf->pte, vmf->ptl);
+    return do_numa_page(vmf);
+  }
+
+  app = per_app_get_current();
+  if (!app) {
+    pr_info_once("[TID %d] [second_fault] page has no per-app. page %p at addr 0x%lx\n",
+      current->pid, page, vmf->address);
+    goto out_map;
+  }
+
+  // promote per-app page
+  pr_info_once("[TID %d] [second_fault] promoting per-app page. page %p at addr 0x%lx\n",
+    current->pid, page, vmf->address);
+  per_app_promote_page_to_hot(page, app);
+
+out_map:
+ /*
+  * Restore the PTE to accessible state.
+  * Use ptep_modify_prot_start/commit for proper TLB management.
+  */
+	old_pte = ptep_modify_prot_start(vma, vmf->address, vmf->pte);
+	pte = pte_modify(old_pte, vma->vm_page_prot);
+	pte = pte_mkyoung(pte);  /* Set accessed bit */
+	if (was_writable)
+		pte = pte_mkwrite(pte);
+	ptep_modify_prot_commit(vma, vmf->address, vmf->pte, old_pte, pte);
+
+	update_mmu_cache(vma, vmf->address, vmf->pte);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+	return 0;
+}
+#endif /* CONFIG_SINGLE_USED_FAULT */
+
 static inline vm_fault_t create_huge_pmd(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
@@ -5250,8 +5425,19 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 	if (!pte_present(vmf->orig_pte))
 		return do_swap_page(vmf);
 
-	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
-		return do_numa_page(vmf);
+#ifdef CONFIG_SINGLE_USED_FAULT
+  if ((pte_flags(vmf->orig_pte) & (_PAGE_PROTNONE | _PAGE_PRESENT)) == _PAGE_PROTNONE 
+      && vma_is_accessible(vmf->vma)) {
+    int ret;
+    FAULT_STATS_START();
+    ret = do_per_app_page(vmf);
+    FAULT_STATS_END(fault_stats);
+    return ret;
+  }
+#else
+  if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
+    return do_numa_page(vmf);
+#endif /* CONFIG_SINGLE_USED_FAULT */
 
 	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
 	spin_lock(vmf->ptl);

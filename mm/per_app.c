@@ -252,7 +252,7 @@ bool per_app_is_cached(struct task_struct *task)
  */
 bool per_app_is_target_uid(uid_t uid)
 {
-  return uid > 10000; 
+  return uid > 10100; 
   /*
   size_t i;
   for (i=0; i<num_target_app_uids; i++) {
@@ -390,10 +390,31 @@ struct per_app *per_app_create(struct task_struct *task)
   app->uid = uid;
   app->pid = pid;
   strncpy(app->app_name, name, PACKAGE_NAME_LEN - 1);
+
+#ifdef CONFIG_PAPP_HOT_COLD
+  /* Initialize cold lists (for single-use pages) */
+  INIT_LIST_HEAD(&app->cold_anon_list);
+  INIT_LIST_HEAD(&app->cold_file_list);
+  spin_lock_init(&app->cold_anon_lock);
+  spin_lock_init(&app->cold_file_lock);
+
+  /* Initialize hot lists (for multi-use pages) */
+  INIT_LIST_HEAD(&app->hot_anon_list);
+  INIT_LIST_HEAD(&app->hot_file_list);
+  spin_lock_init(&app->hot_anon_lock);
+  spin_lock_init(&app->hot_file_lock);
+
+  atomic_long_set(&app->nr_cold_anon, 0);
+  atomic_long_set(&app->nr_cold_file, 0);
+  atomic_long_set(&app->nr_hot_anon, 0);
+  atomic_long_set(&app->nr_hot_file, 0);
+#else
   INIT_LIST_HEAD(&app->page_list);
   spin_lock_init(&app->page_list_lock);
   INIT_LIST_HEAD(&app->file_page_list);
   spin_lock_init(&app->file_page_list_lock);
+#endif /* CONFIG_PAPP_HOT_COLD */
+
   atomic_long_set(&app->nr_pages, 0);
   atomic_long_set(&app->nr_anon_pages, 0);
   atomic_long_set(&app->nr_file_pages, 0);
@@ -820,7 +841,7 @@ int per_app_add_file_page(struct page *page, struct per_app *app) {
 
   VM_BUG_ON_PAGE(PageActive(page) && PageUnevictable(page), page);
   VM_BUG_ON_PAGE(PageLRU(page), page);
-  
+
   if (!app ||!page)
     return -EINVAL;
 
@@ -834,14 +855,25 @@ int per_app_add_file_page(struct page *page, struct per_app *app) {
     pr_warn("[per_app_add_file_page]: this per-app page was managed by lru.\n");
     //list_del_init(&page->lru);
   }
-  
+
   TestClearPageActive(page);
   get_page(page);
+
+#ifdef CONFIG_PAPP_HOT_COLD
+  /* Add to COLD file list (single-use candidate) */
+  ClearPageHot(page);
+  spin_lock(&app->cold_file_lock);
+  list_add_tail(&page->lru, &app->cold_file_list);
+  atomic_long_inc(&app->nr_cold_file);
+  spin_unlock(&app->cold_file_lock);
+#else
   spin_lock(&app->file_page_list_lock);
   list_add_tail(&page->lru, &app->file_page_list);
+  spin_unlock(&app->file_page_list_lock);
+#endif /* CONFIG_PAPP_HOT_COLD */
+
   atomic_long_inc(&app->nr_pages);
   atomic_long_inc(&app->nr_file_pages);
-  spin_unlock(&app->file_page_list_lock);
   put_page(page);
 
   return 0;
@@ -858,13 +890,13 @@ int per_app_add_file_page(struct page *page, struct per_app *app) {
  * returns 0 on success, error code for failure
  */
 int per_app_add_page(struct page *page, struct per_app *app) {
-  
+
   VM_BUG_ON_PAGE(PageActive(page) && PageUnevictable(page), page);
   VM_BUG_ON_PAGE(PageLRU(page), page);
-  
+
   if (!app ||!page)
     return -EINVAL;
-  
+
   // if page is already being managed by per_app, skip or error
   if (TestSetPagePerApp(page))
     return -EEXIST;
@@ -875,20 +907,25 @@ int per_app_add_page(struct page *page, struct per_app *app) {
     pr_warn("[per_app_add_page]: this per-app page was managed by lru.\n");
     //list_del_init(&page->lru);
   }
-  
+
   TestClearPageActive(page);
   get_page(page);
 
+#ifdef CONFIG_PAPP_HOT_COLD
+  /* Add to COLD anon list (single-use candidate) */
+  ClearPageHot(page);
+  spin_lock(&app->cold_anon_lock);
+  list_add_tail(&page->lru, &app->cold_anon_list);
+  atomic_long_inc(&app->nr_cold_anon);
+  spin_unlock(&app->cold_anon_lock);
+#else
   spin_lock(&app->page_list_lock);
   list_add_tail(&page->lru, &app->page_list);
-  atomic_long_inc(&app->nr_pages);
-  if (PageAnon(page)) {
-    atomic_long_inc(&app->nr_anon_pages);
-  } else {
-    atomic_long_inc(&app->nr_file_pages);
-  }
   spin_unlock(&app->page_list_lock);
+#endif /* CONFIG_PAPP_HOT_COLD */
 
+  atomic_long_inc(&app->nr_anon_pages);
+  atomic_long_inc(&app->nr_pages);
   put_page(page);
 
   return 0;
@@ -917,12 +954,34 @@ void per_app_remove_file_page(struct per_app *app, struct page *page)
   if (WARN_ON_ONCE(PageLRU(page))) {
     pr_warn("[per_app_remove_file_page]: removing LRU page, not per-app\n");
   }
-  
+
+#ifdef CONFIG_PAPP_HOT_COLD
+  if (PageHot(page)) {
+    spin_lock(&app->hot_file_lock);
+    list_del(&page->lru);
+    atomic_long_dec(&app->nr_hot_file);
+    atomic_long_dec(&app->nr_pages);
+    atomic_long_dec(&app->nr_file_pages);
+    spin_unlock(&app->hot_file_lock);
+  } else {
+    spin_lock(&app->cold_file_lock);
+    list_del(&page->lru);
+    atomic_long_dec(&app->nr_cold_file);
+    if (atomic_long_read(&app->nr_cold_file) == -1) {
+      DO_ONCE(dump_stack);
+    }
+    atomic_long_dec(&app->nr_pages);
+    atomic_long_dec(&app->nr_file_pages);
+    spin_unlock(&app->cold_file_lock);
+  }
+  ClearPageHot(page);
+#else
   spin_lock(&app->file_page_list_lock);
   list_del(&page->lru);
   atomic_long_dec(&app->nr_pages);
   atomic_long_dec(&app->nr_file_pages);
   spin_unlock(&app->file_page_list_lock);
+#endif
 
   ClearPagePerApp(page);
 }
@@ -937,12 +996,34 @@ void per_app_remove_page(struct per_app *app, struct page *page)
   if (WARN_ON_ONCE(PageLRU(page))) {
     pr_warn("[per_app_remove_page]: removing LRU page, not per-app\n");
   }
-  
+
+#ifdef CONFIG_PAPP_HOT_COLD
+  if (PageHot(page)) {
+    spin_lock(&app->hot_anon_lock);
+    list_del(&page->lru);
+    atomic_long_dec(&app->nr_hot_anon);
+    atomic_long_dec(&app->nr_pages);
+    atomic_long_dec(&app->nr_anon_pages);
+    spin_unlock(&app->hot_anon_lock);
+  } else {
+    spin_lock(&app->cold_anon_lock);
+    list_del(&page->lru);
+    atomic_long_dec(&app->nr_cold_anon);
+    if (atomic_long_read(&app->nr_cold_anon) == -1) {
+      DO_ONCE(dump_stack);
+    }
+    atomic_long_dec(&app->nr_pages);
+    atomic_long_dec(&app->nr_anon_pages);
+    spin_unlock(&app->cold_anon_lock);
+  }
+  ClearPageHot(page);
+#else
   spin_lock(&app->page_list_lock);
   list_del(&page->lru);
   atomic_long_dec(&app->nr_pages);
   atomic_long_dec(&app->nr_anon_pages);
   spin_unlock(&app->page_list_lock);
+#endif
 
   ClearPagePerApp(page);
 }
@@ -977,6 +1058,116 @@ void per_app_move_page_to_lru(struct per_app *app, struct page *page, struct vm_
   }
   */
 }
+
+#ifdef CONFIG_PAPP_HOT_COLD
+/*
+ * Promote page from cold list to hot list
+ */
+void per_app_promote_page_to_hot(struct page *page, struct per_app *app)
+{
+  bool is_anon;
+
+  if (!page || !app) {
+    pr_warn_once("[TID %d] [per_app_promote] NULL page or app\n", current->pid);
+    return;
+  }
+
+  if (!PagePerApp(page)) {
+    pr_warn_once("[TID %d] [per_app_promote] Page %p is not a per-app page\n", current->pid, page);
+    return;
+  }
+
+  /* Check if already promoted - do this WITHOUT setting the flag yet */
+  if (PageHot(page)) {
+    pr_warn_once("[TID %d] [per_app_promote] Page %p already promoted\n", current->pid, page);
+    return;
+  }
+
+  is_anon = PageAnon(page);
+
+  if (is_anon) {
+    /* Remove from cold anon list */
+    spin_lock(&app->cold_anon_lock);
+
+    /* Double-check PageHot under lock in case of race */
+    if (PageHot(page)) {
+      spin_unlock(&app->cold_anon_lock);
+      return; /* Another thread promoted it */
+    }
+
+    /* Check if page is actually in cold list */
+    if (list_empty(&page->lru)) {
+      spin_unlock(&app->cold_anon_lock);
+      pr_warn_once("[TID %d] [per_app_promote] Anon page %p lru list is empty, already promoted? PageHot=%d\n",
+              current->pid, page, PageHot(page));
+      return; /* Already promoted or not in list */
+    }
+
+    list_del_init(&page->lru);
+    //__list_del_entry(&page->lru);
+    atomic_long_dec(&app->nr_cold_anon);
+    if (atomic_long_read(&app->nr_cold_anon) == -1) {
+      DO_ONCE(dump_stack);
+    }
+    spin_unlock(&app->cold_anon_lock);
+
+    /* Add to hot anon list */
+    spin_lock(&app->hot_anon_lock);
+    list_add_tail(&page->lru, &app->hot_anon_list);
+    atomic_long_inc(&app->nr_hot_anon);
+
+    /* Set hot flag AFTER page is in hot list - this prevents remove from checking wrong list */
+    SetPageHot(page);
+
+    spin_unlock(&app->hot_anon_lock);
+
+#ifdef CONFIG_DEBUG_PAPP
+    pr_info("[per_app_promote] Promoted anon page %p from cold to hot (app: %s)\n",
+            page, app->app_name);
+#endif
+  } else {
+    /* Remove from cold file list */
+    spin_lock(&app->cold_file_lock);
+
+    /* Double-check PageHot under lock in case of race */
+    if (PageHot(page)) {
+      spin_unlock(&app->cold_file_lock);
+      return; /* Another thread promoted it */
+    }
+
+    if (list_empty(&page->lru)) {
+      spin_unlock(&app->cold_file_lock);
+      pr_warn_once("[TID %d] [per_app_promote] File page %p lru list is empty, already promoted? PageHot=%d\n",
+              current->pid, page, PageHot(page));
+      return;
+    }
+
+    list_del_init(&page->lru);
+    //__list_del_entry(&page->lru);
+    atomic_long_dec(&app->nr_cold_file);
+    if (atomic_long_read(&app->nr_cold_file) == -1) {
+      DO_ONCE(dump_stack);
+    }
+    spin_unlock(&app->cold_file_lock);
+
+    /* Add to hot file list */
+    spin_lock(&app->hot_file_lock);
+    list_add_tail(&page->lru, &app->hot_file_list);
+    atomic_long_inc(&app->nr_hot_file);
+
+    /* Set hot flag AFTER page is in hot list - this prevents remove from checking wrong list */
+    SetPageHot(page);
+
+    spin_unlock(&app->hot_file_lock);
+
+#ifdef CONFIG_DEBUG_PAPP
+    pr_info("[per_app_promote] Promoted file page %p from cold to hot (app: %s)\n",
+            page, app->app_name);
+#endif
+  }
+}
+#endif /* CONFIG_PAPP_HOT_COLD */
+
 
 #ifdef CONFIG_PAPP_USE_KREF      
 /*
@@ -1232,14 +1423,19 @@ static int per_app_proc_show(struct seq_file *m, void *v)
     seq_printf(m, "Active Tasks: %d\n", atomic_read(&app->nr_tasks));
     seq_printf(m, "Total Pages: %ld\n", atomic_long_read(&app->nr_pages));
     seq_printf(m, "  - Anonymous: %ld\n", atomic_long_read(&app->nr_anon_pages));
+#ifdef CONFIG_PAPP_HOT_COLD
+    seq_printf(m, "    - Hot: %ld\n", atomic_long_read(&app->nr_hot_anon));
+    seq_printf(m, "    - Cold: %ld\n", atomic_long_read(&app->nr_cold_anon));
+#endif /* CONFIG_PAPP_HOT_COLD */
     seq_printf(m, "  - File-backed: %ld\n", atomic_long_read(&app->nr_file_pages));
+#ifdef CONFIG_PAPP_HOT_COLD
+    seq_printf(m, "    - Hot: %ld\n", atomic_long_read(&app->nr_hot_file));
+    seq_printf(m, "    - Cold: %ld\n", atomic_long_read(&app->nr_cold_file));
+#endif /* CONFIG_PAPP_HOT_COLD */
     seq_printf(m, "Total Reclaimed Pages: %ld\n", atomic_long_read(&app->nr_reclaimed));
     seq_printf(m, "  - Reclaimed Anonymous: %ld\n", atomic_long_read(&app->nr_anon_reclaimed));
     seq_printf(m, "  - ReclaimedFile-backed: %ld\n", atomic_long_read(&app->nr_file_reclaimed));
     seq_printf(m, "App reclaim state: R%d\n", app->reclaim_state);
-#ifdef CONFIG_PAPP_USE_KREF
-    seq_printf(m, "App Reference Count: %d\n", kref_read(&app->kref));
-#endif
     seq_printf(m, "---\n");
     nr_total_pages += atomic_long_read(&app->nr_pages);
     nr_total_reclaimed += atomic_long_read(&app->nr_reclaimed);
@@ -1343,15 +1539,15 @@ void per_app_process_fork(struct task_struct *parent, struct task_struct *child)
       atomic_inc(&app->nr_tasks);
       if (strcmp(app->app_name, "main") == 0) {
         if (per_app_update_package_name(app, parent->comm)) {
+#ifdef CONFIG_PAPP_HOME_FILE          
           int ret;
           snprintf(app->home.home_path_str, HOME_PATH_MAX, "/data/user/0/%s", app->app_name);
           ret = kern_path(app->home.home_path_str, LOOKUP_FOLLOW, &app->home.home_path);
           if (ret) {
             WARN(1, "[per_app_process_fork] failed to resolve kernel path for %s\n",
                     app->app_name);
-          } else {
-            //pr_info("[per_app_process_fork] per_app home dentry cache is created\n");
           }
+#endif /* CONFIG_PAPP_HOME_FILE */
         }
       }
 #ifdef CONFIG_PAPP_USE_KREF

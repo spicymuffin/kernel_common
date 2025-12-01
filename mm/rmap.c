@@ -1894,11 +1894,11 @@ void page_add_file_rmap(struct page *page,
         per_app_add_file_page(page, app);
       }
     } else if (page_mapcount(page) > 1 && PagePerApp(page)) {
-      // move file page from app's file page list to LRU
       /*
-      // I maybe need this.. similar in release_pages
-      struct per_app *app = per_app_find_from_page(page);
-      */
+       * V1
+      // move file page from app's file page list to LRU
+      // I may need this.. similar in release_pages
+      //struct per_app *app = per_app_find_from_page(page);
       struct folio *folio = page_folio(page);
       //folio_lock(folio);
       list_del_init(&folio->lru);
@@ -1909,6 +1909,11 @@ void page_add_file_rmap(struct page *page,
       } else {
         // was per-app page, but also was in LRU?
         BUG();
+      }
+      */
+      struct per_app *app = per_app_get_current();
+      if (app) {
+        per_app_move_page_to_lru(app, page, vma);
       }
     }
 #endif /* CONFIG_PAPP */
