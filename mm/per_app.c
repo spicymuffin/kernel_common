@@ -188,6 +188,11 @@ void per_app_manager_exit(void)
   global_app_manager.pid_hash = NULL;
 }
 
+int per_app_nr_apps(void)
+{
+  return atomic_read(&global_app_manager.nr_apps);
+}
+
 /*
  * Clear cached per_app pointer for a task
  * This should be called when credentials change or when the app is no longer valid

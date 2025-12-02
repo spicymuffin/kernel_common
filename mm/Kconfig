@@ -88,6 +88,12 @@ config MEASURE_FAULT
   help
     This option measures overhead of handling second per-app minor fault
 
+config DEBUG_PAPP_RECLAIM
+  bool "debug option for Per-APP memory management"
+  default n
+  help
+    This option enables detailed debugging for per-app (mostly printk).
+
 menuconfig SWAP
 	bool "Support for paging of anonymous memory (swap)"
 	depends on MMU && BLOCK && !ARCH_NO_SWAP

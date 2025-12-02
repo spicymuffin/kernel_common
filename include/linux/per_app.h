@@ -277,6 +277,7 @@ int per_app_instrument_filemap_add_folio(struct address_space *mapping, struct f
 
 int per_app_manager_init(void);
 void per_app_manager_exit(void);
+int per_app_nr_apps(void);
 int __init per_app_init_subsystem(void);
 void __exit per_app_exit_subsystem(void);
 
