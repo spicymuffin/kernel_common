@@ -17,6 +17,7 @@
 #include <linux/swap.h>
 #include <linux/namei.h>
 #include "internal.h"
+#include <linux/ksortd.h>
 
 static int insert_offset = 1;
 
@@ -499,22 +500,29 @@ struct per_app *per_app_find(pid_t pid)
  * update the position of per_app struct in global app list
  * frequently used apps will naturally move towards the head
  */
-void per_app_try_to_update_position(int old_oom, int new_oom)
+void per_app_try_to_update_position(int old_oom, int new_oom, pid_t pid)
 {
   struct per_app *app;
-  app = per_app_get_current();
-  
+
+  //app = per_app_get_current();
+  app = per_app_find(pid);
+
   if (!app)
     return;
-  
+
   /* detect app switch: bg -> fg */
   if (old_oom >= 100 && new_oom == 0) {
 #ifdef CONFIG_DEBUG_PAPP
-    pr_info("[per_app_update_position] per_app with pid %u moved to head\n", app->pid);
+    pr_info("[per_app_update_position] per_app with pid %u moved to head\n", pid);
 #endif
     spin_lock(&global_app_manager.app_list_lock); 
     list_move(&app->app_list, &global_app_manager.app_list);
     spin_unlock(&global_app_manager.app_list_lock); 
+    // wake up ksortd
+    pr_info("[ksortd] about to enqueue\n");
+    if (ksortd_queue_work(pid) == 0) {
+      pr_info("[ksortd]: queued PID %d for single-used page detection\n", pid);
+    }
   }
 
   return;

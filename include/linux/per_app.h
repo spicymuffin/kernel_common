@@ -240,7 +240,7 @@ struct per_app *per_app_find(pid_t pid);
 int per_app_update_package_name(struct per_app *app, char *name);
 
 bool per_app_is_target_uid(uid_t uid);
-void per_app_try_to_update_position(int old_oom, int new_oom);
+void per_app_try_to_update_position(int old_oom, int new_oom, pid_t pid);
 
 #ifdef CONFIG_PAPP_USE_KREF
 struct per_app *per_app_get(struct per_app *app);

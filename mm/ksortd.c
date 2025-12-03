@@ -21,6 +21,8 @@
 #include <linux/swapops.h>
 #include <linux/pagewalk.h>
 #include <linux/pgtable.h>
+#include <linux/workqueue.h>
+#include <linux/ksortd.h>
 #include <uapi/linux/sched/types.h>
 
 /*
@@ -101,6 +103,7 @@ enum ksortd_phase {
 #define KSORTD_MAX_SLEEP_MS          60000
 #define KSORTD_MIN_PAGES             1
 #define KSORTD_MAX_PAGES             10000
+#define KSORTD_WORK_QUEUE_SIZE       64      /* Max pending work items */
 
 /* Configuration variables */
 static unsigned int ksortd_sleep_ms = KSORTD_DEFAULT_SLEEP_MS;
@@ -133,6 +136,17 @@ static DECLARE_WAIT_QUEUE_HEAD(ksortd_wait);
 static struct task_struct *ksortd_thread;
 static DEFINE_MUTEX(ksortd_mutex);
 
+/* Work queue for processing PIDs */
+struct ksortd_work_item {
+	pid_t pid;
+};
+
+static struct ksortd_work_item ksortd_work_queue[KSORTD_WORK_QUEUE_SIZE];
+static unsigned int ksortd_work_queue_head;  /* Next item to dequeue */
+static unsigned int ksortd_work_queue_tail;  /* Next slot to enqueue */
+static unsigned int ksortd_work_queue_count; /* Current number of items */
+static DEFINE_SPINLOCK(ksortd_work_queue_lock);
+
 /* Scan state - protected by ksortd_mutex */
 struct ksortd_scan_state {
 	struct mm_struct *mm;
@@ -154,6 +168,202 @@ struct rmap_check_arg {
 	unsigned int mapcount;
 	unsigned int accessed_count;
 };
+
+/* ========== Forward Declarations ========== */
+static void ksortd_reset_cycle_stats(void);
+static enum ksortd_phase ksortd_get_phase(void);
+static void ksortd_set_phase(enum ksortd_phase phase);
+static bool ksortd_do_batch(enum ksortd_scan_mode mode);
+static bool ksortd_wait_timeout(unsigned int ms, const char *reason);
+
+/* ========== Work Queue Management ========== */
+
+/*
+ * Enqueue a PID for scanning
+ * Returns 0 on success, -ENOSPC if queue is full
+ */
+static int ksortd_enqueue_work(pid_t pid)
+{
+	unsigned long flags;
+	unsigned int i, idx;
+	int ret = 0;
+
+	if (pid == 0)
+		return -EINVAL;
+
+	spin_lock_irqsave(&ksortd_work_queue_lock, flags);
+
+	/* Check if queue is full */
+	if (ksortd_work_queue_count >= KSORTD_WORK_QUEUE_SIZE) {
+		pr_warn("ksortd: Work queue is full, dropping PID %d\n", pid);
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	/* Check if this PID is already in the queue */
+	for (i = 0; i < ksortd_work_queue_count; i++) {
+		idx = (ksortd_work_queue_head + i) % KSORTD_WORK_QUEUE_SIZE;
+		if (ksortd_work_queue[idx].pid == pid) {
+			pr_debug("ksortd: PID %d already in queue, skipping\n", pid);
+			ret = 0;  /* Not an error - already queued */
+			goto out;
+		}
+	}
+
+	/* Add to queue */
+	ksortd_work_queue[ksortd_work_queue_tail].pid = pid;
+	ksortd_work_queue_tail = (ksortd_work_queue_tail + 1) % KSORTD_WORK_QUEUE_SIZE;
+	ksortd_work_queue_count++;
+
+	pr_info("ksortd: Enqueued PID %d (queue size: %u)\n", pid, ksortd_work_queue_count);
+
+out:
+	spin_unlock_irqrestore(&ksortd_work_queue_lock, flags);
+
+	/* Wake up ksortd if we successfully enqueued work */
+	if (ret == 0)
+		wake_up_interruptible(&ksortd_wait);
+
+	return ret;
+}
+
+/*
+ * Dequeue a PID for scanning
+ * Returns 0 if no work available
+ */
+static pid_t ksortd_dequeue_work(void)
+{
+	unsigned long flags;
+	pid_t pid = 0;
+
+	spin_lock_irqsave(&ksortd_work_queue_lock, flags);
+
+	if (ksortd_work_queue_count > 0) {
+		pid = ksortd_work_queue[ksortd_work_queue_head].pid;
+		ksortd_work_queue_head = (ksortd_work_queue_head + 1) % KSORTD_WORK_QUEUE_SIZE;
+		ksortd_work_queue_count--;
+		pr_info("ksortd: Dequeued PID %d (queue size: %u)\n", pid, ksortd_work_queue_count);
+	}
+
+	spin_unlock_irqrestore(&ksortd_work_queue_lock, flags);
+
+	return pid;
+}
+
+/*
+ * Check if there's work in the queue
+ */
+static bool ksortd_has_work(void)
+{
+	unsigned long flags;
+	bool has_work;
+
+	spin_lock_irqsave(&ksortd_work_queue_lock, flags);
+	has_work = (ksortd_work_queue_count > 0);
+	spin_unlock_irqrestore(&ksortd_work_queue_lock, flags);
+
+	return has_work;
+}
+
+/*
+ * Check if ksortd should be active
+ * Returns true if either:
+ *   1. Currently processing a PID (target_pid is set)
+ *   2. There's work in the queue
+ */
+static bool ksortd_should_run(void)
+{
+	bool result;
+
+	mutex_lock(&ksortd_mutex);
+	result = (ksortd_target_pid != 0 && scan_state.mm != NULL);
+	mutex_unlock(&ksortd_mutex);
+
+	/* Also check if there's pending work */
+	if (!result)
+		result = ksortd_has_work();
+
+	return result;
+}
+
+/*
+ * Public API: Queue a PID for ksortd scanning
+ * This is called from other subsystems (e.g., per_app)
+ */
+int ksortd_queue_work(pid_t pid)
+{
+	return ksortd_enqueue_work(pid);
+}
+EXPORT_SYMBOL(ksortd_queue_work);
+
+
+/*
+ * Get mm_struct from PID with proper reference counting
+ * Caller must call mmput() when done
+ */
+static struct mm_struct *ksortd_get_mm_from_pid(pid_t pid)
+{
+	struct task_struct *task;
+	struct mm_struct *mm = NULL;
+
+	if (pid == 0)
+		return NULL;
+
+	rcu_read_lock();
+	task = pid_task(find_vpid(pid), PIDTYPE_PID);
+	if (task)
+		mm = get_task_mm(task);
+	rcu_read_unlock();
+
+	return mm;
+}
+
+/* ========== Target PID Management ========== */
+
+/*
+ * Set target PID for scanning
+ * Called from procfs write handler or work queue
+ */
+static int ksortd_set_target_pid(pid_t pid)
+{
+	struct mm_struct *new_mm, *old_mm;
+
+	new_mm = ksortd_get_mm_from_pid(pid);
+	if (!new_mm && pid != 0) {
+		pr_err("ksortd: Failed to find process with PID %d\n", pid);
+		return -ESRCH;
+	}
+
+	mutex_lock(&ksortd_mutex);
+
+	old_mm = scan_state.mm;
+
+	scan_state.mm = new_mm;
+	scan_state.scan_address = 0;
+	scan_state.phase = (pid != 0) ? KSORTD_PHASE_IDLE : KSORTD_PHASE_IDLE;
+	ksortd_target_pid = pid;
+
+	/* Reset all statistics */
+	ksortd_reset_cycle_stats();
+	ksortd_clear_cycles = 0;
+	ksortd_check_cycles = 0;
+	ksortd_total_cycles = 0;
+
+	mutex_unlock(&ksortd_mutex);
+
+	/* Release old mm outside of mutex */
+	if (old_mm)
+		mmput(old_mm);
+
+	if (pid != 0) {
+		pr_info("ksortd: Target set to PID %d\n", pid);
+		wake_up_interruptible(&ksortd_wait);
+	} else {
+		pr_info("ksortd: Target cleared\n");
+	}
+
+	return 0;
+}
 
 /*
  * rmap callback: Process one PTE mapping of a page
@@ -303,26 +513,6 @@ static bool ksortd_check_page_accessed_rmap(struct page *page,
 	return rca.accessed;
 }
 
-/*
- * Get mm_struct from PID with proper reference counting
- * Caller must call mmput() when done
- */
-static struct mm_struct *ksortd_get_mm_from_pid(pid_t pid)
-{
-	struct task_struct *task;
-	struct mm_struct *mm = NULL;
-
-	if (pid == 0)
-		return NULL;
-
-	rcu_read_lock();
-	task = pid_task(find_vpid(pid), PIDTYPE_PID);
-	if (task)
-		mm = get_task_mm(task);
-	rcu_read_unlock();
-
-	return mm;
-}
 
 /*
  * Process one batch of pages
@@ -546,19 +736,6 @@ static void ksortd_reset_cycle_stats(void)
 	ksortd_skipped_pages = 0;
 }
 
-/*
- * Check if ksortd should be active
- */
-static bool ksortd_should_run(void)
-{
-	bool result;
-
-	mutex_lock(&ksortd_mutex);
-	result = (ksortd_target_pid != 0 && scan_state.mm != NULL);
-	mutex_unlock(&ksortd_mutex);
-
-	return result;
-}
 
 /*
  * Get current phase (thread-safe)
@@ -643,16 +820,37 @@ static int ksortd(void *p)
 	while (!kthread_should_stop()) {
 		enum ksortd_phase phase;
 		bool batch_complete;
+		pid_t next_pid;
 
 		/* Handle freezer for suspend/hibernate */
 		try_to_freeze();
 
-		/* Wait for a target to be set */
+		/* Wait for a target to be set or work to be queued */
 		if (!ksortd_should_run()) {
-			pr_info("ksortd: Idle - waiting for target PID...\n");
+			pr_info("ksortd: Idle - waiting for work...\n");
 			wait_event_interruptible(ksortd_wait,
 				ksortd_should_run() || kthread_should_stop());
 			continue;
+		}
+
+		/*
+		 * Check if we need to pick up new work from the queue
+		 * Only dequeue when we're idle (no current target)
+		 */
+		mutex_lock(&ksortd_mutex);
+		if (ksortd_target_pid == 0 && scan_state.phase == KSORTD_PHASE_IDLE) {
+			mutex_unlock(&ksortd_mutex);
+
+			/* Try to get work from queue */
+			next_pid = ksortd_dequeue_work();
+			if (next_pid != 0) {
+				/* Start processing this PID */
+				if (ksortd_set_target_pid(next_pid) == 0) {
+					pr_info("ksortd: Processing PID %d from work queue\n", next_pid);
+				}
+			}
+		} else {
+			mutex_unlock(&ksortd_mutex);
 		}
 
 		phase = ksortd_get_phase();
@@ -746,50 +944,6 @@ static int ksortd(void *p)
 	return 0;
 }
 
-/*
- * Set target PID for scanning
- * Called from procfs write handler
- */
-static int ksortd_set_target_pid(pid_t pid)
-{
-	struct mm_struct *new_mm, *old_mm;
-
-	new_mm = ksortd_get_mm_from_pid(pid);
-	if (!new_mm && pid != 0) {
-		pr_err("ksortd: Failed to find process with PID %d\n", pid);
-		return -ESRCH;
-	}
-
-	mutex_lock(&ksortd_mutex);
-
-	old_mm = scan_state.mm;
-
-	scan_state.mm = new_mm;
-	scan_state.scan_address = 0;
-	scan_state.phase = (pid != 0) ? KSORTD_PHASE_IDLE : KSORTD_PHASE_IDLE;
-	ksortd_target_pid = pid;
-
-	/* Reset all statistics */
-	ksortd_reset_cycle_stats();
-	ksortd_clear_cycles = 0;
-	ksortd_check_cycles = 0;
-	ksortd_total_cycles = 0;
-
-	mutex_unlock(&ksortd_mutex);
-
-	/* Release old mm outside of mutex */
-	if (old_mm)
-		mmput(old_mm);
-
-	if (pid != 0) {
-		pr_info("ksortd: Target set to PID %d\n", pid);
-		wake_up_interruptible(&ksortd_wait);
-	} else {
-		pr_info("ksortd: Target cleared\n");
-	}
-
-	return 0;
-}
 
 /* ========== Procfs Interface ========== */
 
@@ -1023,6 +1177,12 @@ static int __init ksortd_init(void)
 
 	memset(&scan_state, 0, sizeof(scan_state));
 	scan_state.phase = KSORTD_PHASE_IDLE;
+
+	/* Initialize work queue */
+	memset(ksortd_work_queue, 0, sizeof(ksortd_work_queue));
+	ksortd_work_queue_head = 0;
+	ksortd_work_queue_tail = 0;
+	ksortd_work_queue_count = 0;
 
 	/* Create procfs directory and files */
 	ksortd_proc_dir = proc_mkdir("ksortd", NULL);
