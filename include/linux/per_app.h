@@ -42,6 +42,8 @@ extern const size_t num_target_app_uids;
 #define PER_APP_MIN_RECLAIM_AMOUNT 100
 // tunable parameter
 #define APP_REUSE_DISTANCE 5
+// ksortd should work once in every..
+#define KSORTD_THRESHOLD 2
 
 // which type of page to reclaim?
 enum per_app_reclaim_type {
@@ -132,6 +134,8 @@ struct per_app {
   */
   reclaim_state_t reclaim_state;
   bool reclaimed;
+
+  atomic_t promoted;
 };
 
 

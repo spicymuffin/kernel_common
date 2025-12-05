@@ -457,6 +457,10 @@ struct per_app *per_app_create(struct task_struct *task)
 
   // link the per_app struct to task
   __per_app_set_cached(task, app);
+    
+  // wake up ksortd
+  atomic_set(&app->promoted, 0);
+  ksortd_queue_work(app->pid);
  
 #ifdef CONFIG_DEBUG_PAPP
   pr_info("[per_app_create]: created per_app struct for uid %u pid %u (%s)\n",
@@ -519,10 +523,17 @@ void per_app_try_to_update_position(int old_oom, int new_oom, pid_t pid)
     list_move(&app->app_list, &global_app_manager.app_list);
     spin_unlock(&global_app_manager.app_list_lock); 
     // wake up ksortd
-    pr_info("[ksortd] about to enqueue\n");
+    if (atomic_read(&app->promoted) >= KSORTD_THRESHOLD) {
+      atomic_set(&app->promoted, 0);
+      ksortd_queue_work(pid);
+    } else {
+      atomic_inc(&app->promoted);
+    }
+    /*
     if (ksortd_queue_work(pid) == 0) {
       pr_info("[ksortd]: queued PID %d for single-used page detection\n", pid);
     }
+    */
   }
 
   return;
@@ -642,17 +653,23 @@ int restore_anon_vma_lazy(struct page *page)
   
   //VM_BUG_ON_PAGE(!PageLocked(page), page); 
   
+  if (!page) {
+    pr_info("[restore_anon_vma_lazy] page is NULL\n");
+    BUG();
+  }
+
   ptep = page_pte_lazy(page);
   mm = get_page_mm(ptep);
   address = page->index;
   vma = find_vma(mm, address);
   
   if (!mm) {
-    pr_info("INVALID mm\n");
-    //return 1;
+    pr_info("[restore_anon_vma_lazy] mm is NULL\n");
+    BUG();
   }
   if (!vma) {
-    pr_info("INVALID vma\n");
+    pr_info("[restore_anon_vma_lazy] vma is NULL\n");
+    BUG();
   }
   
   anon_vma = vma->anon_vma->root;
@@ -964,6 +981,9 @@ void per_app_remove_file_page(struct per_app *app, struct page *page)
 {
   if (!app || !page)
     return;
+
+  //if (!PagePerApp(page)) return;
+
   if (WARN_ON_ONCE(PageLRU(page))) {
     pr_warn("[per_app_remove_file_page]: removing LRU page, not per-app\n");
   }
@@ -971,20 +991,21 @@ void per_app_remove_file_page(struct per_app *app, struct page *page)
 #ifdef CONFIG_PAPP_HOT_COLD
   if (PageHot(page)) {
     spin_lock(&app->hot_file_lock);
-    list_del(&page->lru);
-    atomic_long_dec(&app->nr_hot_file);
-    atomic_long_dec(&app->nr_pages);
-    atomic_long_dec(&app->nr_file_pages);
+    if (!list_empty(&page->lru)) {
+      list_del(&page->lru);
+      atomic_long_dec(&app->nr_hot_file);
+      atomic_long_dec(&app->nr_pages);
+      atomic_long_dec(&app->nr_file_pages);
+    }
     spin_unlock(&app->hot_file_lock);
   } else {
     spin_lock(&app->cold_file_lock);
-    list_del(&page->lru);
-    atomic_long_dec(&app->nr_cold_file);
-    if (atomic_long_read(&app->nr_cold_file) == -1) {
-      DO_ONCE(dump_stack);
+    if (!list_empty(&page->lru)) {
+      list_del(&page->lru);
+      atomic_long_dec(&app->nr_cold_file);
+      atomic_long_dec(&app->nr_pages);
+      atomic_long_dec(&app->nr_file_pages);
     }
-    atomic_long_dec(&app->nr_pages);
-    atomic_long_dec(&app->nr_file_pages);
     spin_unlock(&app->cold_file_lock);
   }
   ClearPageHot(page);
@@ -1006,6 +1027,9 @@ void per_app_remove_page(struct per_app *app, struct page *page)
 {
   if (!app || !page)
     return;
+
+  //if (!PagePerApp(page)) return;
+
   if (WARN_ON_ONCE(PageLRU(page))) {
     pr_warn("[per_app_remove_page]: removing LRU page, not per-app\n");
   }
@@ -1013,20 +1037,21 @@ void per_app_remove_page(struct per_app *app, struct page *page)
 #ifdef CONFIG_PAPP_HOT_COLD
   if (PageHot(page)) {
     spin_lock(&app->hot_anon_lock);
-    list_del(&page->lru);
-    atomic_long_dec(&app->nr_hot_anon);
-    atomic_long_dec(&app->nr_pages);
-    atomic_long_dec(&app->nr_anon_pages);
+    if (!list_empty(&page->lru)) {
+      list_del(&page->lru);
+      atomic_long_dec(&app->nr_hot_anon);
+      atomic_long_dec(&app->nr_pages);
+      atomic_long_dec(&app->nr_anon_pages);
+    }
     spin_unlock(&app->hot_anon_lock);
   } else {
     spin_lock(&app->cold_anon_lock);
-    list_del(&page->lru);
-    atomic_long_dec(&app->nr_cold_anon);
-    if (atomic_long_read(&app->nr_cold_anon) == -1) {
-      DO_ONCE(dump_stack);
+    if (!list_empty(&page->lru)) {
+      list_del(&page->lru);
+      atomic_long_dec(&app->nr_cold_anon);
+      atomic_long_dec(&app->nr_pages);
+      atomic_long_dec(&app->nr_anon_pages);
     }
-    atomic_long_dec(&app->nr_pages);
-    atomic_long_dec(&app->nr_anon_pages);
     spin_unlock(&app->cold_anon_lock);
   }
   ClearPageHot(page);
@@ -1424,6 +1449,7 @@ static int per_app_proc_show(struct seq_file *m, void *v)
 {
   struct per_app *app;
   unsigned long nr_total_pages = 0, nr_total_reclaimed = 0;
+  unsigned long nr_total_anon_reclaimed = 0, nr_total_file_reclaimed = 0;
 
   seq_printf(m, "Per-App Memory Management Statistics\n");
   seq_printf(m, "====================================\n");
@@ -1447,16 +1473,20 @@ static int per_app_proc_show(struct seq_file *m, void *v)
 #endif /* CONFIG_PAPP_HOT_COLD */
     seq_printf(m, "Total Reclaimed Pages: %ld\n", atomic_long_read(&app->nr_reclaimed));
     seq_printf(m, "  - Reclaimed Anonymous: %ld\n", atomic_long_read(&app->nr_anon_reclaimed));
-    seq_printf(m, "  - ReclaimedFile-backed: %ld\n", atomic_long_read(&app->nr_file_reclaimed));
+    seq_printf(m, "  - Reclaimed File-backed: %ld\n", atomic_long_read(&app->nr_file_reclaimed));
     seq_printf(m, "App reclaim state: R%d\n", app->reclaim_state);
     seq_printf(m, "---\n");
     nr_total_pages += atomic_long_read(&app->nr_pages);
     nr_total_reclaimed += atomic_long_read(&app->nr_reclaimed);
+    nr_total_anon_reclaimed += atomic_long_read(&app->nr_anon_reclaimed);
+    nr_total_file_reclaimed += atomic_long_read(&app->nr_file_reclaimed);
   }
   seq_printf(m, "Total apps tracked: %d\n\n", 
     atomic_read(&global_app_manager.nr_apps));
   seq_printf(m, "Total per-app pages: %lu\n", nr_total_pages);
   seq_printf(m, "Total per-app reclaimed pages: %lu\n", nr_total_reclaimed);
+  seq_printf(m, "Total anonymous reclaimed pages: %lu\n", nr_total_anon_reclaimed);
+  seq_printf(m, "Total file reclaimed pages: %lu\n", nr_total_file_reclaimed);
   seq_printf(m, "====================================\n");
   spin_unlock(&global_app_manager.app_list_lock);
   

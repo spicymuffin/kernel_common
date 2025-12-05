@@ -23,6 +23,7 @@
 #include <linux/pgtable.h>
 #include <linux/workqueue.h>
 #include <linux/ksortd.h>
+#include <linux/per_app.h>
 #include <uapi/linux/sched/types.h>
 
 /*
@@ -34,9 +35,9 @@
  *
  * OPERATION:
  *   1. User writes PID to /proc/ksortd/pid
- *   2. Wait 10 seconds (configurable)
+ *   2. Wait N seconds (configurable)
  *   3. CLEAR phase: Clear all accessed bits (in batches)
- *   4. Wait 10 seconds (configurable) - process runs, accesses pages
+ *   4. Wait N seconds (configurable) - process runs, accesses pages
  *   5. CHECK phase: Check which pages have accessed bit set (in batches)
  *   6. Report statistics and return to idle
  *
@@ -97,7 +98,7 @@ enum ksortd_phase {
 };
 
 /* Configuration constants */
-#define KSORTD_DEFAULT_SLEEP_MS      10000   /* 10 seconds */
+#define KSORTD_DEFAULT_SLEEP_MS      30000   /* seconds to sleep in between */
 #define KSORTD_DEFAULT_PAGES_TO_SCAN 256
 #define KSORTD_MIN_SLEEP_MS          100
 #define KSORTD_MAX_SLEEP_MS          60000
@@ -149,8 +150,8 @@ static DEFINE_SPINLOCK(ksortd_work_queue_lock);
 
 /* Scan state - protected by ksortd_mutex */
 struct ksortd_scan_state {
-	struct mm_struct *mm;
-	unsigned long scan_address;      /* Current scan position */
+	struct per_app *app;             /* Target per_app struct */
+	unsigned long scan_progress;     /* Pages scanned in current phase */
 	enum ksortd_phase phase;         /* Current phase */
 	bool phase_complete;             /* Current phase iteration complete */
 };
@@ -173,7 +174,7 @@ struct rmap_check_arg {
 static void ksortd_reset_cycle_stats(void);
 static enum ksortd_phase ksortd_get_phase(void);
 static void ksortd_set_phase(enum ksortd_phase phase);
-static bool ksortd_do_batch(enum ksortd_scan_mode mode);
+static bool ksortd_do_scan(enum ksortd_scan_mode mode);
 static bool ksortd_wait_timeout(unsigned int ms, const char *reason);
 
 /* ========== Work Queue Management ========== */
@@ -195,7 +196,9 @@ static int ksortd_enqueue_work(pid_t pid)
 
 	/* Check if queue is full */
 	if (ksortd_work_queue_count >= KSORTD_WORK_QUEUE_SIZE) {
+#ifdef CONFIG_DEBUG_KSORTD
 		pr_warn("ksortd: Work queue is full, dropping PID %d\n", pid);
+#endif
 		ret = -ENOSPC;
 		goto out;
 	}
@@ -204,7 +207,9 @@ static int ksortd_enqueue_work(pid_t pid)
 	for (i = 0; i < ksortd_work_queue_count; i++) {
 		idx = (ksortd_work_queue_head + i) % KSORTD_WORK_QUEUE_SIZE;
 		if (ksortd_work_queue[idx].pid == pid) {
+#ifdef CONFIG_DEBUG_KSORTD
 			pr_debug("ksortd: PID %d already in queue, skipping\n", pid);
+#endif
 			ret = 0;  /* Not an error - already queued */
 			goto out;
 		}
@@ -215,8 +220,9 @@ static int ksortd_enqueue_work(pid_t pid)
 	ksortd_work_queue_tail = (ksortd_work_queue_tail + 1) % KSORTD_WORK_QUEUE_SIZE;
 	ksortd_work_queue_count++;
 
+#ifdef CONFIG_DEBUG_KSORTD
 	pr_info("ksortd: Enqueued PID %d (queue size: %u)\n", pid, ksortd_work_queue_count);
-
+#endif
 out:
 	spin_unlock_irqrestore(&ksortd_work_queue_lock, flags);
 
@@ -242,7 +248,9 @@ static pid_t ksortd_dequeue_work(void)
 		pid = ksortd_work_queue[ksortd_work_queue_head].pid;
 		ksortd_work_queue_head = (ksortd_work_queue_head + 1) % KSORTD_WORK_QUEUE_SIZE;
 		ksortd_work_queue_count--;
+#ifdef CONFIG_DEBUG_KSORTD
 		pr_info("ksortd: Dequeued PID %d (queue size: %u)\n", pid, ksortd_work_queue_count);
+#endif
 	}
 
 	spin_unlock_irqrestore(&ksortd_work_queue_lock, flags);
@@ -268,7 +276,7 @@ static bool ksortd_has_work(void)
 /*
  * Check if ksortd should be active
  * Returns true if either:
- *   1. Currently processing a PID (target_pid is set)
+ *   1. Currently processing a PID (target_pid is set and per_app found)
  *   2. There's work in the queue
  */
 static bool ksortd_should_run(void)
@@ -276,7 +284,7 @@ static bool ksortd_should_run(void)
 	bool result;
 
 	mutex_lock(&ksortd_mutex);
-	result = (ksortd_target_pid != 0 && scan_state.mm != NULL);
+	result = (ksortd_target_pid != 0 && scan_state.app != NULL);
 	mutex_unlock(&ksortd_mutex);
 
 	/* Also check if there's pending work */
@@ -298,24 +306,95 @@ EXPORT_SYMBOL(ksortd_queue_work);
 
 
 /*
- * Get mm_struct from PID with proper reference counting
- * Caller must call mmput() when done
+ * Process a single anonymous page using lazy rmap
+ * Returns true if page was accessed (in CHECK mode)
  */
-static struct mm_struct *ksortd_get_mm_from_pid(pid_t pid)
+static bool ksortd_process_anon_page_lazy(struct page *page,
+					   enum ksortd_scan_mode mode,
+					   unsigned int *mapcount_ret)
 {
-	struct task_struct *task;
-	struct mm_struct *mm = NULL;
+	pte_t *ptep;
+	pte_t pte;
+	struct mm_struct *mm;
+	spinlock_t *ptl;
+	bool accessed = false;
+	unsigned long address;
 
-	if (pid == 0)
-		return NULL;
+	/* Validate page */
+	if (!page || !PagePerApp(page) || !PageAnon(page)) {
+		if (mode == KSORTD_SCAN_CHECK)
+			ksortd_skipped_pages++;
+		return false;
+	}
 
-	rcu_read_lock();
-	task = pid_task(find_vpid(pid), PIDTYPE_PID);
-	if (task)
-		mm = get_task_mm(task);
-	rcu_read_unlock();
+	/* Get PTE from lazy rmap (stored in page->mapping) */
+	ptep = page_pte_lazy(page);
+	if (!ptep) {
+		if (mode == KSORTD_SCAN_CHECK)
+			ksortd_skipped_pages++;
+		return false;
+	}
 
-	return mm;
+	/* Get mm_struct from page table page */
+	mm = get_page_mm(ptep);
+	if (!mm) {
+		if (mode == KSORTD_SCAN_CHECK)
+			ksortd_skipped_pages++;
+		return false;
+	}
+
+	/* Get mapcount */
+	if (mapcount_ret)
+		*mapcount_ret = page_mapcount(page);
+
+	/* Get PTE lock */
+	ptl = &virt_to_page(ptep)->ptl;
+	if (!ptl) {
+		if (mode == KSORTD_SCAN_CHECK)
+			ksortd_skipped_pages++;
+		return false;
+	}
+
+	spin_lock(ptl);
+
+	pte = *ptep;
+
+	/* Verify PTE is still valid and points to our page */
+	if (!pte_present(pte) || pte_page(pte) != page) {
+		spin_unlock(ptl);
+		if (mode == KSORTD_SCAN_CHECK)
+			ksortd_skipped_pages++;
+		return false;
+	}
+
+	/*
+	 * For lazy rmap, we don't need the exact virtual address
+	 * since we're directly accessing the PTE
+	 */
+	address = 0;  /* Not used for lazy rmap */
+
+	if (mode == KSORTD_SCAN_CLEAR) {
+		/* Phase 1: Clear accessed bit */
+		if (pte_young(pte)) {
+			pte_t new_pte = pte_mkold(pte);
+			set_pte_at(mm, address, ptep, new_pte);
+#ifdef CONFIG_DEBUG_KSORTD
+			pr_debug("ksortd: CLEAR lazy anon page\n");
+#endif
+		}
+	} else {
+		/* Phase 2: Check if accessed since clearing */
+		if (pte_young(pte)) {
+			accessed = true;
+#ifdef CONFIG_DEBUG_KSORTD
+			pr_debug("ksortd: CHECK lazy anon page: ACCESSED\n");
+#endif
+		}
+	}
+
+	spin_unlock(ptl);
+
+	return accessed;
 }
 
 /* ========== Target PID Management ========== */
@@ -326,20 +405,23 @@ static struct mm_struct *ksortd_get_mm_from_pid(pid_t pid)
  */
 static int ksortd_set_target_pid(pid_t pid)
 {
-	struct mm_struct *new_mm, *old_mm;
+	struct per_app *new_app, *old_app;
 
-	new_mm = ksortd_get_mm_from_pid(pid);
-	if (!new_mm && pid != 0) {
-		pr_err("ksortd: Failed to find process with PID %d\n", pid);
+	/* Get per_app struct for the target PID */
+	new_app = per_app_find(pid);
+	if (!new_app && pid != 0) {
+#ifdef CONFIG_DEBUG_KSORTD
+		pr_err("ksortd: Failed to find per_app for PID %d\n", pid);
+#endif
 		return -ESRCH;
 	}
 
 	mutex_lock(&ksortd_mutex);
 
-	old_mm = scan_state.mm;
+	old_app = scan_state.app;
 
-	scan_state.mm = new_mm;
-	scan_state.scan_address = 0;
+	scan_state.app = new_app;
+	scan_state.scan_progress = 0;
 	scan_state.phase = (pid != 0) ? KSORTD_PHASE_IDLE : KSORTD_PHASE_IDLE;
 	ksortd_target_pid = pid;
 
@@ -351,15 +433,17 @@ static int ksortd_set_target_pid(pid_t pid)
 
 	mutex_unlock(&ksortd_mutex);
 
-	/* Release old mm outside of mutex */
-	if (old_mm)
-		mmput(old_mm);
+	/* Note: per_app doesn't use reference counting like mm_struct */
 
 	if (pid != 0) {
-		pr_info("ksortd: Target set to PID %d\n", pid);
+#ifdef CONFIG_DEBUG_KSORTD
+		pr_info("ksortd: Target set to PID %d (per_app=%p)\n", pid, new_app);
+#endif
 		wake_up_interruptible(&ksortd_wait);
 	} else {
+#ifdef CONFIG_DEBUG_KSORTD
 		pr_info("ksortd: Target cleared\n");
+#endif
 	}
 
 	return 0;
@@ -418,16 +502,20 @@ static bool ksortd_rmap_one(struct folio *folio, struct vm_area_struct *vma,
 			/* Phase 1: Clear accessed bit */
 			if (pte_young(*pte)) {
 				ptep_test_and_clear_young(vma, address, pte);
+#ifdef CONFIG_DEBUG_KSORTD
 				pr_debug("ksortd: CLEAR accessed bit at 0x%lx\n",
 					 address);
+#endif
 			}
 		} else {
 			/* Phase 2: Check if accessed since clearing */
 			if (pte_young(*pte)) {
 				rca->accessed = true;
 				rca->accessed_count++;
+#ifdef CONFIG_DEBUG_KSORTD
 				pr_debug("ksortd: CHECK at 0x%lx: ACCESSED\n",
 					 address);
+#endif
 			}
 		}
 	}
@@ -515,207 +603,218 @@ static bool ksortd_check_page_accessed_rmap(struct page *page,
 
 
 /*
- * Process one batch of pages
+ * Scan ALL pages in per_app's cold page lists
  * Returns: number of pages actually scanned
  *
- * IMPORTANT: Caller must hold mmap_read_lock
+ * Scans entire cold_anon_list and cold_file_list in one pass.
+ * Uses lock-drop pattern to minimize contention and calls cond_resched()
+ * to yield CPU periodically.
  */
-static unsigned int ksortd_scan_batch(struct mm_struct *mm,
-				      unsigned long *addr_ptr,
-				      unsigned int max_pages,
-				      enum ksortd_scan_mode mode)
+static unsigned int ksortd_scan_per_app_lists(struct per_app *app,
+					       enum ksortd_scan_mode mode)
 {
-	struct vm_area_struct *vma;
-	unsigned long address = *addr_ptr;
+	struct page *page, *tmp;
 	unsigned int scanned = 0;
-	struct page *page;
-	VMA_ITERATOR(vmi, mm, address);
+	unsigned int skipped = 0;
+	bool accessed;
+	unsigned int mapcount;
 
-	for_each_vma(vmi, vma) {
-		/* Align address to VMA start if needed */
-		if (address < vma->vm_start)
-			address = vma->vm_start;
+	if (!app)
+		return 0;
 
-		/* Scan pages within this VMA */
-		while (address < vma->vm_end && scanned < max_pages) {
-			/*
-			 * Get the page at this address
-			 * FOLL_GET takes a reference, we must put_page() later
-			 */
-			page = follow_page(vma, address, FOLL_GET);
-
-			if (!IS_ERR_OR_NULL(page)) {
-				bool is_anon = PageAnon(page);
-				bool accessed;
-				bool was_processed;
-				unsigned int mapcount = 0;
-				unsigned int accessed_count = 0;
-
-				/*
-				 * Check mapcount BEFORE processing
-				 * Skip shared pages (mapcount > 1)
-				 */
-				mapcount = page_mapcount(page);
-				
-				if (mapcount != 1) {
-					/* Skip shared or unmapped pages */
-					if (mode == KSORTD_SCAN_CHECK) {
-						if (mapcount > 1)
-							ksortd_shared_pages++;
-						else
-							ksortd_skipped_pages++;
-					}
-					put_page(page);
-					address += PAGE_SIZE;
-					scanned++;
-					cond_resched();
-					continue;
-				}
-
-				/* Process this single-mapped page via rmap */
-				accessed = ksortd_check_page_accessed_rmap(
-					page, mode, &mapcount, &accessed_count);
-
-				/*
-				 * was_processed is true if rmap walk found the page
-				 * (mapcount from rmap > 0 means we found at least one PTE)
-				 */
-				was_processed = (mapcount > 0);
-
-				scanned++;
-
-				/* Collect statistics only in CHECK phase */
-				if (mode == KSORTD_SCAN_CHECK) {
-					if (was_processed) {
-						ksortd_total_scanned++;
-
-						if (accessed) {
-							ksortd_hot_pages++;
-							if (is_anon) {
-								ksortd_anon_scanned++;
-								ksortd_hot_anon_pages++;
-							} else {
-								ksortd_file_scanned++;
-								ksortd_hot_file_pages++;
-							}
-						} else {
-							ksortd_cold_pages++;
-							if (is_anon) {
-								ksortd_anon_scanned++;
-								ksortd_cold_anon_pages++;
-							} else {
-								ksortd_file_scanned++;
-								ksortd_cold_file_pages++;
-							}
-						}
-					} else {
-						/* Page was skipped (couldn't lock, etc.) */
-						ksortd_skipped_pages++;
-					}
-				}
-
-				put_page(page);
-			}
-
-			address += PAGE_SIZE;
-
-			/* Allow other tasks to run */
-			cond_resched();
+	/*
+	 * Scan ALL cold anonymous pages
+	 * Lock-drop pattern: hold lock only during list iteration,
+	 * drop it while processing each page
+	 */
+	spin_lock(&app->cold_anon_lock);
+	list_for_each_entry_safe(page, tmp, &app->cold_anon_list, lru) {
+		/* Get page reference - page could be freed */
+		if (!get_page_unless_zero(page)) {
+			skipped++;
+			continue;
 		}
 
-		if (scanned >= max_pages)
-			break;
+		spin_unlock(&app->cold_anon_lock);
+
+		/* Validate page is still a per-app anonymous page */
+		if (!PagePerApp(page) || !PageAnon(page)) {
+			put_page(page);
+			skipped++;
+			spin_lock(&app->cold_anon_lock);
+			continue;
+		}
+
+		/* Check mapcount */
+		mapcount = page_mapcount(page);
+
+		if (mapcount > 1) {
+			/* Shared page - account but don't process */
+			if (mode == KSORTD_SCAN_CHECK)
+				ksortd_shared_pages++;
+			put_page(page);
+			scanned++;
+			spin_lock(&app->cold_anon_lock);
+			cond_resched();
+			continue;
+		}
+
+		/* Process anonymous page using lazy rmap */
+		accessed = ksortd_process_anon_page_lazy(page, mode, &mapcount);
+
+		/* Update statistics and promote if accessed */
+		if (mode == KSORTD_SCAN_CHECK) {
+			ksortd_total_scanned++;
+			ksortd_anon_scanned++;
+
+			if (accessed) {
+				ksortd_hot_pages++;
+				ksortd_hot_anon_pages++;
+				/* Promote page from cold to hot */
+				per_app_promote_page_to_hot(page, app);
+#ifdef CONFIG_DEBUG_KSORTD
+				pr_debug("ksortd: Promoted anon page %p\n", page);
+#endif
+			} else {
+				ksortd_cold_pages++;
+				ksortd_cold_anon_pages++;
+			}
+		}
+
+		put_page(page);
+		scanned++;
+		spin_lock(&app->cold_anon_lock);
+		cond_resched();
 	}
+	spin_unlock(&app->cold_anon_lock);
 
-	*addr_ptr = address;
+	/*
+	 * Scan ALL cold file pages
+	 * Same lock-drop pattern
+	 */
+	spin_lock(&app->cold_file_lock);
+	list_for_each_entry_safe(page, tmp, &app->cold_file_list, lru) {
+		/* Get page reference - page could be freed */
+		if (!get_page_unless_zero(page)) {
+			skipped++;
+			continue;
+		}
 
-	/* Check if we've completed a full scan */
-	vma = vma_next(&vmi);
+		spin_unlock(&app->cold_file_lock);
+
+		/* Validate page is still a per-app file page */
+		if (!PagePerApp(page) || PageAnon(page)) {
+			put_page(page);
+			skipped++;
+			spin_lock(&app->cold_file_lock);
+			continue;
+		}
+
+		/* Check mapcount */
+		mapcount = page_mapcount(page);
+
+		if (mapcount > 1) {
+			/* Shared page - account but don't process */
+			if (mode == KSORTD_SCAN_CHECK)
+				ksortd_shared_pages++;
+			put_page(page);
+			scanned++;
+			spin_lock(&app->cold_file_lock);
+			cond_resched();
+			continue;
+		}
+
+		/* Process file page using standard rmap */
+		accessed = ksortd_check_page_accessed_rmap(page, mode, &mapcount, NULL);
+
+		/* Update statistics and promote if accessed */
+		if (mode == KSORTD_SCAN_CHECK) {
+			ksortd_total_scanned++;
+			ksortd_file_scanned++;
+
+			if (accessed) {
+				ksortd_hot_pages++;
+				ksortd_hot_file_pages++;
+				/* Promote page from cold to hot */
+				per_app_promote_page_to_hot(page, app);
+#ifdef CONFIG_DEBUG_KSORTD
+				pr_debug("ksortd: Promoted file page %p\n", page);
+#endif
+			} else {
+				ksortd_cold_pages++;
+				ksortd_cold_file_pages++;
+			}
+		}
+
+		put_page(page);
+		scanned++;
+		spin_lock(&app->cold_file_lock);
+		cond_resched();
+	}
+	spin_unlock(&app->cold_file_lock);
+
+#ifdef CONFIG_DEBUG_KSORTD
+	pr_info("ksortd: Scanned %u pages (%u skipped)\n", scanned, skipped);
+#endif
 	return scanned;
 }
 
 /*
- * Check if we've scanned all VMAs (reached end of address space)
+ * Scan the entire per_app cold lists for one phase
+ * Returns true since we scan everything in one pass
  */
-static bool ksortd_scan_complete(struct mm_struct *mm, unsigned long address)
+static bool ksortd_do_scan(enum ksortd_scan_mode mode)
 {
-	struct vm_area_struct *vma;
-	VMA_ITERATOR(vmi, mm, address);
-
-	vma = vma_next(&vmi);
-	return (vma == NULL);
-}
-
-/*
- * Perform one batch of work for the current phase
- * Returns true if this phase is complete (all pages scanned)
- *
- * This function acquires and releases mmap_read_lock internally
- * to ensure we don't hold locks while sleeping
- */
-static bool ksortd_do_batch(enum ksortd_scan_mode mode)
-{
-	struct mm_struct *mm;
+	struct per_app *app;
 	unsigned int scanned;
-	unsigned int pages_to_scan;
-	bool complete = false;
-	unsigned long start_addr;
 
 	/*
-	 * Get a reference to mm under mutex protection
-	 * We'll hold this reference while scanning
+	 * Get app under mutex protection
 	 */
 	mutex_lock(&ksortd_mutex);
-	mm = scan_state.mm;
-	if (mm)
-		mmget(mm);
-	start_addr = scan_state.scan_address;
-	pages_to_scan = ksortd_thread_pages_to_scan;
+	app = scan_state.app;
 	mutex_unlock(&ksortd_mutex);
 
-	if (!mm) {
-		pr_debug("ksortd: No target mm_struct\n");
+	if (!app) {
+#ifdef CONFIG_DEBUG_KSORTD
+		pr_debug("ksortd: No target per_app\n");
+#endif
 		return true;
 	}
 
 	/*
-	 * Try to acquire mmap_read_lock
-	 * Use trylock to avoid blocking if the process is doing mmap operations
+	 * Verify per_app is still valid by checking if we can find it
+	 * This protects against per_app being freed while we're scanning
 	 */
-	if (!mmap_read_trylock(mm)) {
-		pr_debug("ksortd: Failed to acquire mmap lock, will retry\n");
-		mmput(mm);
-		return false;  /* Will retry next iteration */
+	if (per_app_find(ksortd_target_pid) != app) {
+#ifdef CONFIG_DEBUG_KSORTD
+		pr_warn("ksortd: per_app %p no longer valid for PID %d\n", app, ksortd_target_pid);
+#endif
+		return true;  /* Abort this scan */
 	}
 
-	/* Scan one batch of pages */
-	scanned = ksortd_scan_batch(mm, &start_addr, pages_to_scan, mode);
+	/* Scan ALL pages in per_app's cold lists */
+	scanned = ksortd_scan_per_app_lists(app, mode);
 
-	/* Check if we've completed scanning all pages */
-	complete = ksortd_scan_complete(mm, start_addr);
-
-	mmap_read_unlock(mm);
-
-	/* Update scan position under mutex */
+	/* Update scan progress under mutex */
 	mutex_lock(&ksortd_mutex);
-	if (scan_state.mm == mm) {  /* Verify mm hasn't changed */
-		scan_state.scan_address = start_addr;
-		if (complete) {
-			scan_state.scan_address = 0;  /* Reset for next phase */
-		}
+	if (scan_state.app == app) {  /* Verify app hasn't changed */
+		scan_state.scan_progress = scanned;
 	}
 	mutex_unlock(&ksortd_mutex);
 
-	mmput(mm);
-
 	if (mode == KSORTD_SCAN_CLEAR) {
-		pr_info("ksortd: [CLEAR] Processed %u pages\n", scanned);
+#ifdef CONFIG_DEBUG_KSORTD
+		pr_info("ksortd: [CLEAR] Scanned %u pages\n", scanned);
+#endif
 	} else {
-		pr_info("ksortd: [CHECK] Processed %u pages (hot=%lu, cold=%lu)\n",
+#ifdef CONFIG_DEBUG_KSORTD
+		pr_info("ksortd: [CHECK] Scanned %u pages (hot=%lu, cold=%lu)\n",
 			scanned, ksortd_hot_pages, ksortd_cold_pages);
+#endif
 	}
 
-	return complete;
+	return true;  /* Always complete in one pass */
 }
 
 /*
@@ -758,7 +857,7 @@ static void ksortd_set_phase(enum ksortd_phase phase)
 {
 	mutex_lock(&ksortd_mutex);
 	scan_state.phase = phase;
-	scan_state.scan_address = 0;  /* Reset scan position on phase change */
+	scan_state.scan_progress = 0;  /* Reset scan progress on phase change */
 	mutex_unlock(&ksortd_mutex);
 }
 
@@ -770,7 +869,9 @@ static bool ksortd_wait_timeout(unsigned int ms, const char *reason)
 {
 	long timeout;
 
+#ifdef CONFIG_DEBUG_KSORTD
 	pr_info("ksortd: Waiting %u ms (%s)...\n", ms, reason);
+#endif
 
 	timeout = wait_event_interruptible_timeout(
 		ksortd_wait,
@@ -815,7 +916,9 @@ static int ksortd(void *p)
 	 */
 	sched_setscheduler(current, SCHED_IDLE, &param);
 
+#ifdef CONFIG_DEBUG_KSORTD
 	pr_info("ksortd: Thread started (SCHED_IDLE policy)\n");
+#endif
 
 	while (!kthread_should_stop()) {
 		enum ksortd_phase phase;
@@ -827,7 +930,9 @@ static int ksortd(void *p)
 
 		/* Wait for a target to be set or work to be queued */
 		if (!ksortd_should_run()) {
+#ifdef CONFIG_DEBUG_KSORTD
 			pr_info("ksortd: Idle - waiting for work...\n");
+#endif
 			wait_event_interruptible(ksortd_wait,
 				ksortd_should_run() || kthread_should_stop());
 			continue;
@@ -846,7 +951,9 @@ static int ksortd(void *p)
 			if (next_pid != 0) {
 				/* Start processing this PID */
 				if (ksortd_set_target_pid(next_pid) == 0) {
+#ifdef CONFIG_DEBUG_KSORTD
 					pr_info("ksortd: Processing PID %d from work queue\n", next_pid);
+#endif
 				}
 			}
 		} else {
@@ -858,7 +965,9 @@ static int ksortd(void *p)
 		switch (phase) {
 		case KSORTD_PHASE_IDLE:
 			/* New target set - transition to waiting for CLEAR phase */
+#ifdef CONFIG_DEBUG_KSORTD
 			pr_info("ksortd: New target acquired, starting scan cycle\n");
+#endif
 			ksortd_set_phase(KSORTD_PHASE_WAIT_CLEAR);
 			break;
 
@@ -868,17 +977,21 @@ static int ksortd(void *p)
 						 "before CLEAR phase"))
 				continue;
 
+#ifdef CONFIG_DEBUG_KSORTD
 			pr_info("ksortd: ===== Starting CLEAR Phase =====\n");
+#endif
 			ksortd_set_phase(KSORTD_PHASE_CLEARING);
 			break;
 
 		case KSORTD_PHASE_CLEARING:
-			/* Process one batch of pages in CLEAR mode */
-			batch_complete = ksortd_do_batch(KSORTD_SCAN_CLEAR);
+			/* Scan all pages in CLEAR mode */
+			batch_complete = ksortd_do_scan(KSORTD_SCAN_CLEAR);
 
 			if (batch_complete) {
 				ksortd_clear_cycles++;
+#ifdef CONFIG_DEBUG_KSORTD
 				pr_info("ksortd: CLEAR phase complete - all accessed bits cleared\n");
+#endif
 				ksortd_set_phase(KSORTD_PHASE_WAIT_CHECK);
 			}
 			/*
@@ -894,18 +1007,21 @@ static int ksortd(void *p)
 						 "before CHECK phase"))
 				continue;
 
+#ifdef CONFIG_DEBUG_KSORTD
 			pr_info("ksortd: ===== Starting CHECK Phase =====\n");
+#endif
 			ksortd_reset_cycle_stats();
 			ksortd_set_phase(KSORTD_PHASE_CHECKING);
 			break;
 
 		case KSORTD_PHASE_CHECKING:
-			/* Process one batch of pages in CHECK mode */
-			batch_complete = ksortd_do_batch(KSORTD_SCAN_CHECK);
+			/* Scan all pages in CHECK mode */
+			batch_complete = ksortd_do_scan(KSORTD_SCAN_CHECK);
 
 			if (batch_complete) {
 				ksortd_check_cycles++;
 				ksortd_total_cycles++;
+#ifdef CONFIG_DEBUG_KSORTD
 				pr_info("ksortd: ===== Scan Complete =====\n");
 				pr_info("ksortd: Results - Hot: %lu, Cold: %lu, Total: %lu\n",
 					ksortd_hot_pages, ksortd_cold_pages,
@@ -914,6 +1030,7 @@ static int ksortd(void *p)
 					pr_info("ksortd: Hot ratio: %lu%%\n",
 						(ksortd_hot_pages * 100) / ksortd_total_scanned);
 				}
+#endif
 				/* Scan complete - go to COMPLETE phase */
 				ksortd_set_phase(KSORTD_PHASE_COMPLETE);
 			}
@@ -925,7 +1042,9 @@ static int ksortd(void *p)
 			 * Cycle complete - clear target and go back to idle.
 			 * User must write a new PID (or same PID) to start again.
 			 */
+#ifdef CONFIG_DEBUG_KSORTD
 			pr_info("ksortd: Cycle complete, returning to idle\n");
+#endif
 			mutex_lock(&ksortd_mutex);
 			ksortd_target_pid = 0;  /* Clear target */
 			/* Keep mm reference for stats viewing, but mark as done */
@@ -934,13 +1053,17 @@ static int ksortd(void *p)
 			break;
 
 		default:
+#ifdef CONFIG_DEBUG_KSORTD
 			pr_warn("ksortd: Unknown phase %d, resetting to idle\n", phase);
+#endif
 			ksortd_set_phase(KSORTD_PHASE_IDLE);
 			break;
 		}
 	}
 
+#ifdef CONFIG_DEBUG_KSORTD
 	pr_info("ksortd: Thread stopping\n");
+#endif
 	return 0;
 }
 
@@ -1017,7 +1140,8 @@ static int ksortd_stats_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "=== State ===\n");
 	seq_printf(m, "Current phase: %s\n", ksortd_phase_str(scan_state.phase));
-	seq_printf(m, "Scan address: 0x%lx\n", scan_state.scan_address);
+	seq_printf(m, "Scan progress: %lu pages\n", scan_state.scan_progress);
+	seq_printf(m, "Per-app: %p\n", scan_state.app);
 	seq_printf(m, "\n");
 
 	seq_printf(m, "=== Cycle Counts ===\n");
@@ -1229,12 +1353,9 @@ static void __exit ksortd_exit(void)
 	/* Remove procfs entries */
 	remove_proc_subtree("ksortd", NULL);
 
-	/* Release mm reference */
+	/* Clear per_app reference */
 	mutex_lock(&ksortd_mutex);
-	if (scan_state.mm) {
-		mmput(scan_state.mm);
-		scan_state.mm = NULL;
-	}
+	scan_state.app = NULL;
 	mutex_unlock(&ksortd_mutex);
 
 	pr_info("ksortd: Shutdown complete\n");

@@ -24,29 +24,11 @@ config DEBUG_PAPP
   help
     This option enables detailed debugging for per-app (mostly printk).
 
-config PAPP_PID
-  bool "use PID-based management for per-app (1 app = 1 process)"
-  default n
-  help
-    This option enables PID-based per-app memory management.
-
 config PAPP_USE_KREF
   bool "use kref for managing per_app struct"
   default n
   help
     If enabled, use kref to manage per_app struct refcount
-
-config PAPP_BASELINE_RECLAIM_POLICY
-  bool "use baseline memory reclaim"
-  default n
-  help
-    baseline memory reclaim logic
-
-config PAPP_USE_2Q
-  bool "use 2q instead of LRU"
-  default n
-  help
-    2-queue
 
 config MEASURE_RMAP
   bool "Measure reverse map walking overhead"
@@ -93,6 +75,12 @@ config DEBUG_PAPP_RECLAIM
   default n
   help
     This option enables detailed debugging for per-app (mostly printk).
+
+config DEBUG_KSORTD
+  bool "debug option for ksortd"
+  default n
+  help
+    This option enables detailed debugging for ksortd
 
 menuconfig SWAP
 	bool "Support for paging of anonymous memory (swap)"
