@@ -6557,9 +6557,6 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	struct mem_cgroup *target_memcg = sc->target_mem_cgroup;
 	struct mem_cgroup *memcg;
 
-  // debug
-  pr_info("[shrink_node_memcgs] function is called\n");
-
 	memcg = mem_cgroup_iter(target_memcg, NULL, NULL);
 	do {
 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
@@ -6604,9 +6601,6 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 		reclaimed = sc->nr_reclaimed;
 		scanned = sc->nr_scanned;
     
-    // debug
-    pr_info("[shrink_node_memcgs] memcg: 0x%p, lruvec: 0x%p\n", memcg, lruvec);
-
 		shrink_lruvec(lruvec, sc);
 
 		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
@@ -8020,6 +8014,7 @@ static unsigned long __per_app_isolate_from_list(struct list_head *src,
 
 		/* Skip shared pages */
 		if (folio_mapcount(folio) > 1) {
+			move_to = &folios_skipped;
 			goto move;
 		}
 
@@ -8492,7 +8487,7 @@ static unsigned int per_app_move_folios_to_cold_hot_list(struct per_app *app,
 			continue;
 		}
 
-		folio_set_per_app(folio);
+		//folio_set_per_app(folio);
 
 		if (unlikely(folio_put_testzero(folio))) {
 			folio_clear_per_app(folio);
@@ -8508,6 +8503,8 @@ static unsigned int per_app_move_folios_to_cold_hot_list(struct per_app *app,
 
 		/* Move back to original cold/hot list (lock already held) */
 		list_add(&folio->lru, dest_list);
+		
+    folio_set_per_app(folio);
 
 		nr_pages = folio_nr_pages(folio);
 		nr_moved += nr_pages;
@@ -8602,7 +8599,7 @@ static unsigned long per_app_reclaim_from_app_phase(struct per_app *app,
 			enum vm_event_item item;
 
 			nr_to_scan = min(sc->nr_to_reclaim - sc->nr_reclaimed,
-					 (unsigned long)SWAP_CLUSTER_MAX);
+					 (unsigned long)APP_CLUSTER_MAX);
 
 			/* Isolate pages from this list type */
 			nr_taken = per_app_isolate_from_list_type(app, nr_to_scan, &folio_list,
@@ -8748,9 +8745,10 @@ static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc,
 		return false;
 	}
 
-	/* Calculate how many apps to scan (nr_apps / threshold) */
+	/* Calculate how many apps to scan */
 	total_apps = (unsigned long)per_app_nr_apps();
-	nr_apps_to_scan = max(total_apps / threshold, 1UL);
+	//nr_apps_to_scan = max(total_apps / threshold, 1UL);
+  nr_apps_to_scan = ((total_apps * threshold) / 100);
 
 	#ifdef CONFIG_DEBUG_PAPP_RECLAIM
 	pr_info("[per_app] Phase %u START: total_apps=%lu, nr_apps_to_scan=%lu, nr_to_reclaim=%lu\n",
@@ -8872,7 +8870,7 @@ static bool per_app_shrink_node(pg_data_t *pgdat, struct scan_control *sc,
 				bool is_file = (current_list_type == LIST_FILE);
 
 				nr_to_scan = min(sc->nr_to_reclaim - sc->nr_reclaimed,
-						 (unsigned long)SWAP_CLUSTER_MAX);
+						 (unsigned long)APP_CLUSTER_MAX);
 
 				/* Isolate from file or anon list */
 				if (is_file) {
@@ -9038,7 +9036,7 @@ restart:
 #ifdef CONFIG_PAPP
 	{
 		/* Per-app reclaim threshold: reclaim from bottom nr_apps/threshold apps */
-		unsigned int per_app_threshold = 2;  /* Reclaim from bottom half of apps */
+		unsigned int per_app_threshold = 80;  /* Reclaim threshold percentage */
 
 		sc.may_writepage = 1; // enable zRAM swap out
 		sc.reclaim_idx = highest_zoneidx;

@@ -1079,11 +1079,19 @@ void release_pages(struct page **pages, int nr)
         // V1: just delete the folio
         /*
         folio_lock(folio);
-        list_del_init(&folio->lru);
+        if (!list_empty(&folio->lru)) {
+          list_del_init(&folio->lru);
+        }
         ClearPagePerApp(&folio->page);
+#ifdef CONFIG_PAPP_HOT_COLD
+        ClearPageHot(&folio->page);
+#endif
         folio_unlock(folio);
+        goto skip_lru_del;
         */
+
         // V2: just skip for now..
+        continue;
       }
 		}
 check_lru:
