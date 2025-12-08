@@ -142,6 +142,5 @@ obj-$(CONFIG_IO_MAPPING) += io-mapping.o
 obj-$(CONFIG_HAVE_BOOTMEM_INFO_NODE) += bootmem_info.o
 obj-$(CONFIG_GENERIC_IOREMAP) += ioremap.o
 obj-$(CONFIG_SHRINKER_DEBUG) += shrinker_debug.o
-obj-$(CONFIG_PAPP) += per_app.o
+obj-$(CONFIG_PAPP) += per_app.o ksortd.o
 obj-y += check_memcg.o track_files.o
-obj-y += ksortd.o
