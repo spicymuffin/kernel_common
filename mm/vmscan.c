@@ -9035,9 +9035,6 @@ restart:
 
 #ifdef CONFIG_PAPP
 	{
-		/* Per-app reclaim threshold: reclaim from bottom nr_apps/threshold apps */
-		unsigned int per_app_threshold = 80;  /* Reclaim threshold percentage */
-
 		sc.may_writepage = 1; // enable zRAM swap out
 		sc.reclaim_idx = highest_zoneidx;
 
@@ -9047,7 +9044,7 @@ restart:
 		pr_info("[per_app] ===== Starting Phase 1: Cold pages =====\n");
 		#endif
 		/* Phase 1: Reclaim cold pages (cold_file + cold_anon) - fast and cheap */
-		per_app_was_enough = per_app_shrink_node(pgdat, &sc, 1, per_app_threshold);
+		per_app_was_enough = per_app_shrink_node(pgdat, &sc, 1, PAPP_RECLAIM_THRESHOLD);
 		if (per_app_was_enough) {
 			#ifdef CONFIG_DEBUG_PAPP_RECLAIM
 			pr_info("[per_app] Phase 1 satisfied goal, exiting\n");
@@ -9063,7 +9060,7 @@ restart:
 		pr_info("[per_app] ===== Starting Phase 2: Hot file pages =====\n");
 		#endif
 		/* Phase 2: Reclaim hot file pages - medium cost */
-		per_app_was_enough = per_app_shrink_node(pgdat, &sc, 2, per_app_threshold);
+		per_app_was_enough = per_app_shrink_node(pgdat, &sc, 2, PAPP_RECLAIM_THRESHOLD);
 		if (per_app_was_enough) {
 			#ifdef CONFIG_DEBUG_PAPP_RECLAIM
 			pr_info("[per_app] Phase 2 satisfied goal, exiting\n");
@@ -9079,7 +9076,7 @@ restart:
 		pr_info("[per_app] ===== Starting Phase 3: Hot anon pages =====\n");
 		#endif
 		/* Phase 3: Reclaim hot anon pages - expensive (requires swap) */
-		per_app_was_enough = per_app_shrink_node(pgdat, &sc, 3, per_app_threshold);
+		per_app_was_enough = per_app_shrink_node(pgdat, &sc, 3, PAPP_RECLAIM_THRESHOLD);
 		trace_per_app_shrink_node_end(rdtsc(), sc.nr_reclaimed);
 		if (per_app_was_enough) {
 			#ifdef CONFIG_DEBUG_PAPP_RECLAIM

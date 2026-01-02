@@ -44,6 +44,8 @@ extern const size_t num_target_app_uids;
 #define APP_REUSE_DISTANCE 5
 // ksortd should work once in every..
 #define KSORTD_THRESHOLD 2
+// ratio of apps to scan during reclaim
+#define PAPP_RECLAIM_THRESHOLD 60
 
 // which type of page to reclaim?
 enum per_app_reclaim_type {
