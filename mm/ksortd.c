@@ -100,15 +100,19 @@ enum ksortd_phase {
 /* Configuration constants */
 #define KSORTD_DEFAULT_SLEEP_MS      30000   /* seconds to sleep in between */
 #define KSORTD_DEFAULT_PAGES_TO_SCAN 256
+#define KSORTD_DEFAULT_NUM_CYCLES    1       /* default: single scan cycle */
 #define KSORTD_MIN_SLEEP_MS          100
 #define KSORTD_MAX_SLEEP_MS          60000
 #define KSORTD_MIN_PAGES             1
 #define KSORTD_MAX_PAGES             10000
+#define KSORTD_MIN_CYCLES            1
+#define KSORTD_MAX_CYCLES            100     /* max 100 continuous cycles */
 #define KSORTD_WORK_QUEUE_SIZE       64      /* Max pending work items */
 
 /* Configuration variables */
 static unsigned int ksortd_sleep_ms = KSORTD_DEFAULT_SLEEP_MS;
 static unsigned int ksortd_thread_pages_to_scan = KSORTD_DEFAULT_PAGES_TO_SCAN;
+static unsigned int ksortd_num_cycles = KSORTD_DEFAULT_NUM_CYCLES;
 static pid_t ksortd_target_pid;
 
 /* Statistics - cumulative across all cycles */
@@ -148,12 +152,25 @@ static unsigned int ksortd_work_queue_tail;  /* Next slot to enqueue */
 static unsigned int ksortd_work_queue_count; /* Current number of items */
 static DEFINE_SPINLOCK(ksortd_work_queue_lock);
 
+/* Per-cycle statistics for temporal analysis */
+#define MAX_CYCLE_HISTORY 20
+struct ksortd_cycle_stats {
+	unsigned long cycle_number;
+	unsigned long hot_pages;
+	unsigned long cold_pages;
+	unsigned long total_scanned;
+	unsigned long timestamp;  /* jiffies when cycle completed */
+};
+
 /* Scan state - protected by ksortd_mutex */
 struct ksortd_scan_state {
 	struct per_app *app;             /* Target per_app struct */
 	unsigned long scan_progress;     /* Pages scanned in current phase */
 	enum ksortd_phase phase;         /* Current phase */
 	bool phase_complete;             /* Current phase iteration complete */
+	unsigned int cycles_remaining;   /* Number of cycles left to run */
+	unsigned int current_cycle;      /* Current cycle number (1-based) */
+	struct ksortd_cycle_stats cycle_history[MAX_CYCLE_HISTORY]; /* Last N cycles */
 };
 
 static struct ksortd_scan_state scan_state;
@@ -423,6 +440,9 @@ static int ksortd_set_target_pid(pid_t pid)
 	scan_state.app = new_app;
 	scan_state.scan_progress = 0;
 	scan_state.phase = (pid != 0) ? KSORTD_PHASE_IDLE : KSORTD_PHASE_IDLE;
+	scan_state.cycles_remaining = ksortd_num_cycles;
+	scan_state.current_cycle = 0;
+	memset(scan_state.cycle_history, 0, sizeof(scan_state.cycle_history));
 	ksortd_target_pid = pid;
 
 	/* Reset all statistics */
@@ -659,6 +679,20 @@ static unsigned int ksortd_scan_per_app_lists(struct per_app *app,
 			continue;
 		}
 
+		/* Handle PG_first flag for newly allocated pages */
+		if (mode == KSORTD_SCAN_CHECK && PageFirst(page)) {
+			/* First encounter - clear PG_first and PTE accessed bits */
+			ClearPageFirst(page);
+			/* Clear accessed bits via lazy rmap */
+			ksortd_process_anon_page_lazy(page, KSORTD_SCAN_CLEAR, &mapcount);
+			/* Don't count in statistics yet - will be checked in next cycle */
+			put_page(page);
+			scanned++;
+			spin_lock(&app->cold_anon_lock);
+			cond_resched();
+			continue;
+		}
+
 		/* Process anonymous page using lazy rmap */
 		accessed = ksortd_process_anon_page_lazy(page, mode, &mapcount);
 
@@ -717,6 +751,20 @@ static unsigned int ksortd_scan_per_app_lists(struct per_app *app,
 			/* Shared page - account but don't process */
 			if (mode == KSORTD_SCAN_CHECK)
 				ksortd_shared_pages++;
+			put_page(page);
+			scanned++;
+			spin_lock(&app->cold_file_lock);
+			cond_resched();
+			continue;
+		}
+
+		/* Handle PG_first flag for newly allocated pages */
+		if (mode == KSORTD_SCAN_CHECK && PageFirst(page)) {
+			/* First encounter - clear PG_first and PTE accessed bits */
+			ClearPageFirst(page);
+			/* Clear accessed bits via rmap */
+			ksortd_check_page_accessed_rmap(page, KSORTD_SCAN_CLEAR, &mapcount, NULL);
+			/* Don't count in statistics yet - will be checked in next cycle */
 			put_page(page);
 			scanned++;
 			spin_lock(&app->cold_file_lock);
@@ -1019,10 +1067,26 @@ static int ksortd(void *p)
 			batch_complete = ksortd_do_scan(KSORTD_SCAN_CHECK);
 
 			if (batch_complete) {
+				unsigned int idx;
+
 				ksortd_check_cycles++;
 				ksortd_total_cycles++;
+
+				/* Record this cycle's statistics */
+				mutex_lock(&ksortd_mutex);
+				scan_state.current_cycle++;
+				idx = (scan_state.current_cycle - 1) % MAX_CYCLE_HISTORY;
+				scan_state.cycle_history[idx].cycle_number = scan_state.current_cycle;
+				scan_state.cycle_history[idx].hot_pages = ksortd_hot_pages;
+				scan_state.cycle_history[idx].cold_pages = ksortd_cold_pages;
+				scan_state.cycle_history[idx].total_scanned = ksortd_total_scanned;
+				scan_state.cycle_history[idx].timestamp = jiffies;
+				scan_state.cycles_remaining--;
+				mutex_unlock(&ksortd_mutex);
+
 #ifdef CONFIG_DEBUG_KSORTD
-				pr_info("ksortd: ===== Scan Complete =====\n");
+				pr_info("ksortd: ===== Cycle %u Complete =====\n",
+					scan_state.current_cycle);
 				pr_info("ksortd: Results - Hot: %lu, Cold: %lu, Total: %lu\n",
 					ksortd_hot_pages, ksortd_cold_pages,
 					ksortd_total_scanned);
@@ -1030,6 +1094,8 @@ static int ksortd(void *p)
 					pr_info("ksortd: Hot ratio: %lu%%\n",
 						(ksortd_hot_pages * 100) / ksortd_total_scanned);
 				}
+				pr_info("ksortd: Cycles remaining: %u\n",
+					scan_state.cycles_remaining);
 #endif
 				/* Scan complete - go to COMPLETE phase */
 				ksortd_set_phase(KSORTD_PHASE_COMPLETE);
@@ -1039,17 +1105,32 @@ static int ksortd(void *p)
 
 		case KSORTD_PHASE_COMPLETE:
 			/*
-			 * Cycle complete - clear target and go back to idle.
-			 * User must write a new PID (or same PID) to start again.
+			 * Cycle complete - check if more cycles needed.
+			 * First cycle does CLEAR->CHECK.
+			 * Subsequent cycles skip CLEAR and only do CHECK
+			 * to accumulate single-use page detection.
 			 */
-#ifdef CONFIG_DEBUG_KSORTD
-			pr_info("ksortd: Cycle complete, returning to idle\n");
-#endif
 			mutex_lock(&ksortd_mutex);
-			ksortd_target_pid = 0;  /* Clear target */
-			/* Keep mm reference for stats viewing, but mark as done */
-			scan_state.phase = KSORTD_PHASE_IDLE;
-			mutex_unlock(&ksortd_mutex);
+			if (scan_state.cycles_remaining > 0) {
+#ifdef CONFIG_DEBUG_KSORTD
+				pr_info("ksortd: Starting next cycle (%u remaining)\n",
+					scan_state.cycles_remaining);
+#endif
+				/*
+				 * Skip CLEAR phase for all subsequent cycles.
+				 * Only the first cycle clears PTEs.
+				 * This allows cumulative detection of single-use pages.
+				 */
+				scan_state.phase = KSORTD_PHASE_WAIT_CHECK;
+				mutex_unlock(&ksortd_mutex);
+			} else {
+#ifdef CONFIG_DEBUG_KSORTD
+				pr_info("ksortd: All cycles complete, returning to idle\n");
+#endif
+				ksortd_target_pid = 0;  /* Clear target */
+				scan_state.phase = KSORTD_PHASE_IDLE;
+				mutex_unlock(&ksortd_mutex);
+			}
 			break;
 
 		default:
@@ -1136,11 +1217,14 @@ static int ksortd_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "Target PID: %d\n", ksortd_target_pid);
 	seq_printf(m, "Sleep interval: %u ms\n", ksortd_sleep_ms);
 	seq_printf(m, "Pages per batch: %u\n", ksortd_thread_pages_to_scan);
+	seq_printf(m, "Number of cycles: %u\n", ksortd_num_cycles);
 	seq_printf(m, "\n");
 
 	seq_printf(m, "=== State ===\n");
 	seq_printf(m, "Current phase: %s\n", ksortd_phase_str(scan_state.phase));
 	seq_printf(m, "Scan progress: %lu pages\n", scan_state.scan_progress);
+	seq_printf(m, "Current cycle: %u\n", scan_state.current_cycle);
+	seq_printf(m, "Cycles remaining: %u\n", scan_state.cycles_remaining);
 	seq_printf(m, "Per-app: %p\n", scan_state.app);
 	seq_printf(m, "\n");
 
@@ -1177,6 +1261,38 @@ static int ksortd_stats_show(struct seq_file *m, void *v)
 			   (ksortd_hot_pages * 100) / ksortd_total_scanned);
 		seq_printf(m, "Cold ratio: %lu%%\n",
 			   (ksortd_cold_pages * 100) / ksortd_total_scanned);
+	}
+
+	/* Show per-cycle history for temporal analysis */
+	if (scan_state.current_cycle > 0) {
+		unsigned int i, num_to_show;
+
+		seq_printf(m, "\n");
+		seq_printf(m, "=== Per-Cycle History ===\n");
+		seq_printf(m, "Cycle# | Hot Pages | Cold Pages | Total  | Hot%% | Timestamp\n");
+		seq_printf(m, "-------|-----------|------------|--------|------|----------\n");
+
+		/* Show up to MAX_CYCLE_HISTORY or current_cycle, whichever is smaller */
+		num_to_show = scan_state.current_cycle < MAX_CYCLE_HISTORY ?
+			      scan_state.current_cycle : MAX_CYCLE_HISTORY;
+
+		for (i = 0; i < num_to_show; i++) {
+			struct ksortd_cycle_stats *cycle = &scan_state.cycle_history[i];
+			unsigned long hot_pct = 0;
+
+			if (cycle->total_scanned > 0)
+				hot_pct = (cycle->hot_pages * 100) / cycle->total_scanned;
+
+			if (cycle->cycle_number > 0) {  /* Only show valid entries */
+				seq_printf(m, "%-6lu | %-9lu | %-10lu | %-6lu | %-4lu%% | %lu\n",
+					   cycle->cycle_number,
+					   cycle->hot_pages,
+					   cycle->cold_pages,
+					   cycle->total_scanned,
+					   hot_pct,
+					   cycle->timestamp);
+			}
+		}
 	}
 
 	mutex_unlock(&ksortd_mutex);
@@ -1289,6 +1405,52 @@ static const struct proc_ops ksortd_pages_ops = {
 	.proc_release = single_release,
 };
 
+static ssize_t ksortd_cycles_write(struct file *file, const char __user *buffer,
+				   size_t count, loff_t *ppos)
+{
+	char buf[32];
+	unsigned int cycles;
+	int ret;
+
+	if (count > sizeof(buf) - 1)
+		return -EINVAL;
+
+	if (copy_from_user(buf, buffer, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	ret = kstrtouint(buf, 10, &cycles);
+	if (ret)
+		return ret;
+
+	if (cycles < KSORTD_MIN_CYCLES || cycles > KSORTD_MAX_CYCLES)
+		return -EINVAL;
+
+	WRITE_ONCE(ksortd_num_cycles, cycles);
+	pr_info("ksortd: Number of cycles set to %u\n", cycles);
+	return count;
+}
+
+static int ksortd_cycles_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", ksortd_num_cycles);
+	return 0;
+}
+
+static int ksortd_cycles_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ksortd_cycles_show, NULL);
+}
+
+static const struct proc_ops ksortd_cycles_ops = {
+	.proc_open = ksortd_cycles_open,
+	.proc_read = seq_read,
+	.proc_write = ksortd_cycles_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
 /* ========== Module Init/Exit ========== */
 
 static struct proc_dir_entry *ksortd_proc_dir;
@@ -1319,6 +1481,7 @@ static int __init ksortd_init(void)
 	proc_create("stats", 0444, ksortd_proc_dir, &ksortd_stats_ops);
 	proc_create("sleep_ms", 0666, ksortd_proc_dir, &ksortd_sleep_ops);
 	proc_create("pages_to_scan", 0666, ksortd_proc_dir, &ksortd_pages_ops);
+	proc_create("num_cycles", 0666, ksortd_proc_dir, &ksortd_cycles_ops);
 
 	/* Start the kernel thread */
 	ksortd_thread = kthread_run(ksortd, NULL, "ksortd");
@@ -1332,10 +1495,11 @@ static int __init ksortd_init(void)
 	pr_info("ksortd: Initialization complete\n");
 	pr_info("ksortd: Operation: WAIT -> CLEAR (batched) -> WAIT -> CHECK (batched) -> repeat\n");
 	pr_info("ksortd: Usage:\n");
-	pr_info("  echo <PID> > /proc/ksortd/pid        # Set target process\n");
-	pr_info("  cat /proc/ksortd/stats               # View statistics\n");
-	pr_info("  echo <ms> > /proc/ksortd/sleep_ms    # Set wait interval\n");
-	pr_info("  echo <n> > /proc/ksortd/pages_to_scan # Set batch size\n");
+	pr_info("  echo <PID> > /proc/ksortd/pid          # Set target process\n");
+	pr_info("  cat /proc/ksortd/stats                 # View statistics\n");
+	pr_info("  echo <ms> > /proc/ksortd/sleep_ms      # Set wait interval\n");
+	pr_info("  echo <n> > /proc/ksortd/pages_to_scan  # Set batch size\n");
+	pr_info("  echo <n> > /proc/ksortd/num_cycles     # Set number of scan cycles (default: 1)\n");
 
 	return 0;
 }

@@ -459,8 +459,8 @@ struct per_app *per_app_create(struct task_struct *task)
   __per_app_set_cached(task, app);
     
   // wake up ksortd
-  atomic_set(&app->promoted, 0);
-  ksortd_queue_work(app->pid);
+  //atomic_set(&app->promoted, 0);
+  //ksortd_queue_work(app->pid);
  
 #ifdef CONFIG_DEBUG_PAPP
   pr_info("[per_app_create]: created per_app struct for uid %u pid %u (%s)\n",
@@ -523,15 +523,12 @@ void per_app_try_to_update_position(int old_oom, int new_oom, pid_t pid)
     list_move(&app->app_list, &global_app_manager.app_list);
     spin_unlock(&global_app_manager.app_list_lock); 
     // wake up ksortd
+    /*
     if (atomic_read(&app->promoted) >= KSORTD_THRESHOLD) {
       atomic_set(&app->promoted, 0);
       ksortd_queue_work(pid);
     } else {
       atomic_inc(&app->promoted);
-    }
-    /*
-    if (ksortd_queue_work(pid) == 0) {
-      pr_info("[ksortd]: queued PID %d for single-used page detection\n", pid);
     }
     */
   }
@@ -892,6 +889,7 @@ int per_app_add_file_page(struct page *page, struct per_app *app) {
 #ifdef CONFIG_PAPP_HOT_COLD
   /* Add to COLD file list (single-use candidate) */
   ClearPageHot(page);
+  SetPageFirst(page);  /* Mark as first allocation - not yet scanned by ksortd */
   spin_lock(&app->cold_file_lock);
   list_add_tail(&page->lru, &app->cold_file_list);
   atomic_long_inc(&app->nr_cold_file);
@@ -944,6 +942,7 @@ int per_app_add_page(struct page *page, struct per_app *app) {
 #ifdef CONFIG_PAPP_HOT_COLD
   /* Add to COLD anon list (single-use candidate) */
   ClearPageHot(page);
+  SetPageFirst(page);  /* Mark as first allocation - not yet scanned by ksortd */
   spin_lock(&app->cold_anon_lock);
   list_add_tail(&page->lru, &app->cold_anon_list);
   atomic_long_inc(&app->nr_cold_anon);

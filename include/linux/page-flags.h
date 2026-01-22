@@ -142,6 +142,7 @@ enum pageflags {
   	PG_per_app,
 #ifdef CONFIG_PAPP_HOT_COLD
     PG_hot,
+    PG_first,		/* First allocation/access - not yet scanned by ksortd */
 #endif /* CONFIG_PAPP_HOT_COLD */
 #endif /* CONFIG_PAPP */
 #ifdef CONFIG_64BIT
@@ -528,6 +529,11 @@ PAGEFLAG(Hot, hot, PF_ANY)
 	__SETPAGEFLAG(Hot, hot, PF_ANY)
 	TESTCLEARFLAG(Hot, hot, PF_ANY)
 	TESTSETFLAG(Hot, hot, PF_ANY)
+PAGEFLAG(First, first, PF_ANY)
+	__CLEARPAGEFLAG(First, first, PF_ANY)
+	__SETPAGEFLAG(First, first, PF_ANY)
+	TESTCLEARFLAG(First, first, PF_ANY)
+	TESTSETFLAG(First, first, PF_ANY)
 #endif /* CONFIG_PAPP_HOT_COLD */
 #endif /* CONFIG_PAPP */
 

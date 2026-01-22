@@ -137,7 +137,8 @@
 	{1UL << PG_swapbacked,		"swapbacked"	},		\
 	{1UL << PG_unevictable,		"unevictable"	},		\
 	{1UL << PG_per_app,		"per_app"	},		\
-	{1UL << PG_hot,		"hot"	}		\
+	{1UL << PG_hot,		"hot"	},		\
+	{1UL << PG_first,		"first"	}		\
 IF_HAVE_PG_MLOCK(PG_mlocked,		"mlocked"	)		\
 IF_HAVE_PG_UNCACHED(PG_uncached,	"uncached"	)		\
 IF_HAVE_PG_HWPOISON(PG_hwpoison,	"hwpoison"	)		\
